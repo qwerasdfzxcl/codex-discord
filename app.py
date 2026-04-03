@@ -258,7 +258,7 @@ def load_app_config() -> AppConfig:
     restart_staging_args = parse_command_args(
         "main_commands.restart_staging",
         main_commands.get("restart_staging"),
-        default=["/usr/bin/systemctl", "restart", "codex-discord-staging"],
+        default=["./scripts/systemd-restart-service.sh", "codex-discord-staging"],
     )
     deploy_args = parse_command_args(
         "main_commands.deploy",

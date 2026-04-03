@@ -16,8 +16,7 @@
   ],
   "main_commands": {
     "restart_staging": [
-      "/usr/bin/systemctl",
-      "restart",
+      "./scripts/systemd-restart-service.sh",
       "codex-discord-staging"
     ],
     "deploy": [

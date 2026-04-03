@@ -126,8 +126,7 @@ LOG_LEVEL=INFO
   ],
   "main_commands": {
     "restart_staging": [
-      "/usr/bin/systemctl",
-      "restart",
+      "./scripts/systemd-restart-service.sh",
       "codex-discord-staging"
     ],
     "deploy": [
@@ -152,6 +151,8 @@ LOG_LEVEL=INFO
 - 상대경로를 쓰면 현재 `config.json` 파일이 있는 디렉터리 기준으로 해석됩니다.
 - `main` bot은 자기 자신의 `main/` checkout을 workspace로 매핑할 수 없습니다.
 - `codex-discord` 프로젝트 자체를 관리하려면 채널을 `.../codex-discord/staging`에 매핑해야 합니다.
+- `restart-staging`과 `deploy`는 `scripts/systemd-restart-service.sh`를 통해 서비스를 재시작합니다.
+- system service를 쓸 경우, bot 실행 사용자에게 passwordless sudo로 `systemctl restart codex-discord-staging`와 `systemctl restart codex-discord-main` 권한을 줘야 합니다.
 
 ## 실행
 
@@ -178,14 +179,23 @@ python app.py
 - `systemd/codex-discord-main.service`
 - `systemd/codex-discord-staging.service`
 
+권장 방식은 user service입니다.
+
 설치 예:
 
 ```bash
-sudo cp /srv/codex-discord/main/systemd/codex-discord-main.service /etc/systemd/system/
-sudo cp /srv/codex-discord/staging/systemd/codex-discord-staging.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now codex-discord-main
-sudo systemctl enable --now codex-discord-staging
+mkdir -p ~/.config/systemd/user
+cp /home/qwerasdfzxcl/codex-discord/main/systemd/codex-discord-main.service ~/.config/systemd/user/
+cp /home/qwerasdfzxcl/codex-discord/staging/systemd/codex-discord-staging.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now codex-discord-main
+systemctl --user enable --now codex-discord-staging
+```
+
+로그아웃 후에도 계속 돌릴 계획이면 root로 한 번만 다음을 실행합니다.
+
+```bash
+sudo loginctl enable-linger qwerasdfzxcl
 ```
 
 ## 배포 스크립트
@@ -194,6 +204,7 @@ sudo systemctl enable --now codex-discord-staging
 
 - `main` checkout에서 `staging` 브랜치를 `main`에 merge
 - merge가 성공하면 main 서비스 재시작
+- 서비스 재시작은 `scripts/systemd-restart-service.sh`를 통해 수행됩니다.
 
 실제 운영 전에 다음은 반드시 검토해야 합니다.
 

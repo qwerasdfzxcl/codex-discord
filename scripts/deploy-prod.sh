@@ -8,7 +8,7 @@ STAGING_CHECKOUT="${ROOT_DIR}/staging"
 PROD_SERVICE="${PROD_SERVICE:-codex-discord-main}"
 MAIN_BRANCH="${MAIN_BRANCH:-main}"
 STAGING_BRANCH="${STAGING_BRANCH:-staging}"
-SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+RESTART_HELPER="${RESTART_HELPER:-${SCRIPT_DIR}/systemd-restart-service.sh}"
 
 die() {
   echo "$1" >&2
@@ -23,8 +23,8 @@ if [[ ! -d "$MAIN_CHECKOUT" ]]; then
   die "Missing main checkout: $MAIN_CHECKOUT"
 fi
 
-if [[ ! -x "$SYSTEMCTL_BIN" ]]; then
-  die "Missing systemctl binary: $SYSTEMCTL_BIN"
+if [[ ! -x "$RESTART_HELPER" ]]; then
+  die "Missing restart helper: $RESTART_HELPER"
 fi
 
 git -C "$MAIN_CHECKOUT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Main checkout is not a git worktree"
@@ -59,7 +59,7 @@ STAGING_HEAD="$(git -C "$STAGING_CHECKOUT" rev-parse --short HEAD)"
 
 git -C "$MAIN_CHECKOUT" merge --no-ff --no-edit "$STAGING_BRANCH"
 
-"$SYSTEMCTL_BIN" restart "$PROD_SERVICE"
+"$RESTART_HELPER" "$PROD_SERVICE"
 
 CURRENT_MAIN="$(git -C "$MAIN_CHECKOUT" rev-parse --short HEAD)"
 

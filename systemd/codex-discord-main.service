@@ -1,15 +1,14 @@
 [Unit]
 Description=Codex Discord Main Bot
-After=network.target
+After=default.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/srv/codex-discord/main
-EnvironmentFile=/srv/codex-discord/main/.env
-ExecStart=/srv/codex-discord/main/.venv/bin/python /srv/codex-discord/main/app.py
+WorkingDirectory=/home/qwerasdfzxcl/codex-discord/main
+EnvironmentFile=/home/qwerasdfzxcl/codex-discord/main/.env
+ExecStart=/home/qwerasdfzxcl/codex-discord/main/.venv/bin/python /home/qwerasdfzxcl/codex-discord/main/app.py
 Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

@@ -1,7 +1,7 @@
 {
   "channels": {
-    "111111111111111111": "/srv/codex-discord/dev",
-    "222222222222222222": "/srv/codex-discord/dev/subproject"
+    "111111111111111111": ".",
+    "222222222222222222": "subproject"
   },
   "timeout_seconds": 900,
   "history_messages": 20,

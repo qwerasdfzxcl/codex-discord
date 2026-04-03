@@ -113,6 +113,23 @@ def configure_logging() -> None:
     )
 
 
+def infer_checkout_paths(bot_role: str) -> tuple[Path, Path]:
+    checkout_path = Path(__file__).resolve().parent
+    container_root = checkout_path.parent
+    expected_checkout_name = "prod" if bot_role == "main" else "dev"
+    expected_checkout_path = (container_root / expected_checkout_name).resolve()
+    dev_workspace_root = (container_root / "dev").resolve()
+
+    if checkout_path != expected_checkout_path:
+        raise ConfigError(
+            f"BOT_ROLE={bot_role} expects app.py under {expected_checkout_path}, got {checkout_path}"
+        )
+    if not dev_workspace_root.is_dir():
+        raise ConfigError(f"Derived dev workspace root does not exist: {dev_workspace_root}")
+
+    return checkout_path, dev_workspace_root
+
+
 def read_env_settings() -> dict[str, object]:
     load_dotenv()
 
@@ -128,33 +145,23 @@ def read_env_settings() -> dict[str, object]:
     if bot_role not in {"main", "staging"}:
         raise ConfigError("BOT_ROLE must be either 'main' or 'staging'")
 
-    checkout_path_raw = os.getenv("CHECKOUT_PATH", "").strip()
-    if not checkout_path_raw:
-        raise ConfigError("CHECKOUT_PATH is missing from .env")
-
-    dev_workspace_root_raw = os.getenv("DEV_WORKSPACE_ROOT", "").strip()
-    if not dev_workspace_root_raw:
-        raise ConfigError("DEV_WORKSPACE_ROOT is missing from .env")
-
     config_path_raw = os.getenv("CODEX_DISCORD_CONFIG", "config/config.json").strip()
     if not config_path_raw:
         raise ConfigError("CODEX_DISCORD_CONFIG must not be empty")
 
     guild_id_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
-
-    checkout_path = Path(checkout_path_raw).expanduser().resolve()
-    dev_workspace_root = Path(dev_workspace_root_raw).expanduser().resolve()
-    config_path = Path(config_path_raw).expanduser().resolve()
+    checkout_path, dev_workspace_root = infer_checkout_paths(bot_role)
+    config_path = (checkout_path / config_path_raw).expanduser().resolve()
 
     if not checkout_path.is_dir():
-        raise ConfigError(f"CHECKOUT_PATH does not exist: {checkout_path}")
+        raise ConfigError(f"Derived checkout path does not exist: {checkout_path}")
     if not dev_workspace_root.is_dir():
-        raise ConfigError(f"DEV_WORKSPACE_ROOT does not exist: {dev_workspace_root}")
+        raise ConfigError(f"Derived dev workspace root does not exist: {dev_workspace_root}")
 
     if bot_role == "staging" and not is_relative_to(checkout_path, dev_workspace_root):
-        raise ConfigError("staging bot CHECKOUT_PATH must be inside DEV_WORKSPACE_ROOT")
+        raise ConfigError("staging bot checkout path must stay inside the derived dev workspace root")
     if bot_role == "main" and is_relative_to(checkout_path, dev_workspace_root):
-        raise ConfigError("main bot CHECKOUT_PATH must not be inside DEV_WORKSPACE_ROOT")
+        raise ConfigError("main bot checkout path must not be inside the derived dev workspace root")
 
     guild_id = int(guild_id_raw) if guild_id_raw else None
 
@@ -193,7 +200,11 @@ def load_app_config() -> AppConfig:
         if not isinstance(workspace_raw, str) or not workspace_raw.strip():
             raise ConfigError(f"workspace path missing for channel {channel_id}")
 
-        workspace_path = Path(workspace_raw).expanduser().resolve()
+        raw_workspace_path = Path(workspace_raw).expanduser()
+        if raw_workspace_path.is_absolute():
+            workspace_path = raw_workspace_path.resolve()
+        else:
+            workspace_path = (dev_workspace_root / raw_workspace_path).resolve()
         if not workspace_path.is_dir():
             raise ConfigError(f"workspace directory not found for channel {channel_id}: {workspace_path}")
         if not is_relative_to(workspace_path, dev_workspace_root):

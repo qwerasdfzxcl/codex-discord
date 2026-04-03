@@ -4,9 +4,9 @@ After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/qwerasdfzxcl/codex-discord/main
-EnvironmentFile=/home/qwerasdfzxcl/codex-discord/main/.env
-ExecStart=/home/qwerasdfzxcl/codex-discord/main/.venv/bin/python /home/qwerasdfzxcl/codex-discord/main/app.py
+WorkingDirectory=%h/codex-discord/main
+EnvironmentFile=%h/codex-discord/main/.env
+ExecStart=%h/codex-discord/main/.venv/bin/python %h/codex-discord/main/app.py
 Restart=on-failure
 RestartSec=5
 

@@ -7,6 +7,10 @@
   "history_messages": 20,
   "max_prompt_chars": 12000,
   "codex_bin": "codex",
+  "codex_global_args": [
+    "-a",
+    "on-request"
+  ],
   "codex_exec_args": [
     "--model",
     "gpt-5.4",

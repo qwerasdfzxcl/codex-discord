@@ -20,6 +20,7 @@ DISCORD_MESSAGE_LIMIT = 1900
 DISCORD_FILE_FALLBACK_LIMIT = 8000
 DISCORD_THREAD_NAME_LIMIT = 100
 DEFAULT_TIMEOUT_SECONDS = 900
+BREAK_CONFIRM_TIMEOUT_SECONDS = 10
 DEFAULT_HISTORY_MESSAGES = 20
 DEFAULT_MAX_PROMPT_CHARS = 12000
 EMBED_DESCRIPTION_LIMIT = 4000
@@ -834,6 +835,14 @@ class ThreadSessionRuntime:
             await self.process.stdin.drain()
 
     async def send_request(self, method: str, params: dict[str, object] | None) -> dict[str, object]:
+        request_id, future = await self.start_request(method, params)
+        return await future
+
+    async def start_request(
+        self,
+        method: str,
+        params: dict[str, object] | None,
+    ) -> tuple[int, asyncio.Future[dict[str, object]]]:
         await self.ensure_started()
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -843,7 +852,12 @@ class ThreadSessionRuntime:
         if params is not None:
             payload["params"] = params
         await self.write_json(payload)
-        return await future
+        return request_id, future
+
+    def abandon_request(self, request_id: int, future: asyncio.Future[dict[str, object]]) -> None:
+        current = self.pending_requests.get(request_id)
+        if current is future:
+            self.pending_requests.pop(request_id, None)
 
     async def send_response(self, request_id: int | str, result: dict[str, object]) -> None:
         if self.process is None or self.process.returncode is not None or not self.started:
@@ -941,20 +955,79 @@ class ThreadSessionRuntime:
         if record is None:
             return False, "현재 스레드에 연결된 Codex 세션이 없어요."
 
-        turn_id = self.get_active_turn_id()
-        if turn_id is None:
+        state = self.get_active_turn_state()
+        if state is None or not state.turn_id:
             return False, "중단할 활성 turn이 없어요."
+        if state.completion_future.done():
+            return False, "현재 turn은 이미 끝난 상태예요."
+
+        turn_id = state.turn_id
 
         self.note_turn_event("turn/interrupt requested", turn_id=turn_id)
-        await self.send_request(
+        request_id, request_future = await self.start_request(
             "turn/interrupt",
             {
                 "threadId": record.session_id,
                 "turnId": turn_id,
             },
         )
-        logging.warning("turn interrupt requested thread=%s turn=%s", self.discord_thread_id, turn_id)
-        return True, f"현재 작업 중인 turn `{turn_id}`에 중단 요청을 보냈어요."
+        logging.warning(
+            "turn interrupt dispatched thread=%s turn=%s request=%s",
+            self.discord_thread_id,
+            turn_id,
+            request_id,
+        )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + BREAK_CONFIRM_TIMEOUT_SECONDS
+        wait_targets: set[asyncio.Future[dict[str, object]]] = {request_future, state.completion_future}
+        turn: dict[str, object] | None = None
+        while turn is None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self.abandon_request(request_id, request_future)
+                logging.warning(
+                    "turn interrupt confirmation timed out thread=%s turn=%s timeout=%ss",
+                    self.discord_thread_id,
+                    turn_id,
+                    BREAK_CONFIRM_TIMEOUT_SECONDS,
+                )
+                return (
+                    False,
+                    f"중단 요청은 보냈지만 {BREAK_CONFIRM_TIMEOUT_SECONDS}초 안에 실제 중단을 확인하지 못했어요.",
+                )
+
+            done, _ = await asyncio.wait(wait_targets, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                continue
+
+            if request_future in done:
+                try:
+                    request_future.result()
+                except Exception as exc:
+                    self.abandon_request(request_id, request_future)
+                    logging.exception(
+                        "turn interrupt request failed thread=%s turn=%s request=%s",
+                        self.discord_thread_id,
+                        turn_id,
+                        request_id,
+                    )
+                    return False, f"중단 요청 전달 자체가 실패했어요.\n`{exc}`"
+                wait_targets.discard(request_future)
+
+            if state.completion_future in done:
+                turn = state.completion_future.result()
+
+        self.abandon_request(request_id, request_future)
+        status = str(turn.get("status", "unknown")) if isinstance(turn, dict) else "unknown"
+        if status == "interrupted":
+            logging.warning("turn interrupt confirmed thread=%s turn=%s", self.discord_thread_id, turn_id)
+            return True, f"현재 작업 중이던 turn `{turn_id}`이 실제로 중단됐어요."
+        if status == "completed":
+            return False, f"중단 요청 전에 turn `{turn_id}`이 이미 완료됐어요."
+        if status == "failed":
+            return False, f"turn `{turn_id}`이 중단 대신 실패 상태로 끝났어요."
+        return False, f"turn `{turn_id}`이 예상과 다른 상태 `{status}`로 끝났어요."
 
 
 class CodexDiscordBot(commands.Bot):

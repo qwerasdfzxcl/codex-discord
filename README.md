@@ -184,14 +184,14 @@ sudo systemctl enable --now codex-discord-staging
 
 ## 배포 스크립트
 
-`scripts/deploy-prod.sh`는 단순 예시입니다.
+`scripts/deploy-prod.sh`는 git 기반 예시입니다.
 
-- dev checkout 내용을 prod checkout으로 `rsync`
-- prod 서비스 재시작
+- `prod` checkout에서 `staging` 브랜치를 `main`에 merge
+- merge가 성공하면 prod 서비스 재시작
 
 실제 운영 전에 다음은 반드시 검토해야 합니다.
 
-- 제외할 파일 목록
+- merge 정책
 - 서비스 이름
 - 권한과 sudo/systemd 정책
 
@@ -203,7 +203,8 @@ sudo systemctl enable --now codex-discord-staging
 4. 같은 thread에서 `/ask prompt:"현재 디렉터리 구조를 설명해줘"`를 실행합니다.
 5. `/status`로 현재 역할과 최근 실행 상태를 확인합니다.
 6. workspace에 변경이 있으면 `/diff`로 변경 파일과 diff stat을 확인합니다.
-7. main bot에서는 `/restart_staging`, `/deploy`가 보이고, staging bot에서는 보이지 않는지 확인합니다.
+7. staging에서 커밋을 하나 만든 뒤 main bot에서 `/deploy`를 실행합니다.
+8. main bot에서는 `/restart_staging`, `/deploy`가 보이고, staging bot에서는 보이지 않는지 확인합니다.
 
 ## 구현 제한
 

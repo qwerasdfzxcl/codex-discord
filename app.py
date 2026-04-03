@@ -39,6 +39,7 @@ class AppConfig:
     history_messages: int
     max_prompt_chars: int
     codex_bin: str
+    codex_global_args: list[str]
     codex_exec_args: list[str]
     restart_args: list[str]
     restart_staging_args: list[str]
@@ -310,6 +311,11 @@ def load_app_config() -> AppConfig:
     history_messages = int(raw.get("history_messages", DEFAULT_HISTORY_MESSAGES))
     max_prompt_chars = int(raw.get("max_prompt_chars", DEFAULT_MAX_PROMPT_CHARS))
     codex_bin = str(raw.get("codex_bin", "codex"))
+    codex_global_args = parse_command_args(
+        "codex_global_args",
+        raw.get("codex_global_args"),
+        default=[],
+    )
     codex_exec_args = parse_command_args(
         "codex_exec_args",
         raw.get("codex_exec_args"),
@@ -356,6 +362,7 @@ def load_app_config() -> AppConfig:
         history_messages=history_messages,
         max_prompt_chars=max_prompt_chars,
         codex_bin=codex_bin,
+        codex_global_args=codex_global_args,
         codex_exec_args=codex_exec_args,
         restart_args=restart_args,
         restart_staging_args=restart_staging_args,
@@ -709,6 +716,7 @@ class CodexDiscordBot(commands.Bot):
     def build_codex_exec_args(self, workspace: Path, prompt: str) -> list[str]:
         return [
             self.config.codex_bin,
+            *self.config.codex_global_args,
             "exec",
             "--json",
             "-C",
@@ -720,6 +728,7 @@ class CodexDiscordBot(commands.Bot):
     def build_codex_resume_args(self, session_id: str, prompt: str) -> list[str]:
         return [
             self.config.codex_bin,
+            *self.config.codex_global_args,
             "exec",
             "resume",
             "--json",

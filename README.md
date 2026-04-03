@@ -120,6 +120,10 @@ LOG_LEVEL=INFO
   "history_messages": 20,
   "max_prompt_chars": 12000,
   "codex_bin": "codex",
+  "codex_global_args": [
+    "-a",
+    "never"
+  ],
   "codex_exec_args": [
     "--model",
     "gpt-5.4",
@@ -147,6 +151,7 @@ LOG_LEVEL=INFO
 
 - `channels`: 부모 채널 ID -> workspace 경로 매핑
 - `codex_bin`: Codex 바이너리 경로 또는 이름
+- `codex_global_args`: `codex` 서브커맨드 앞에 붙는 전역 인자 배열. 예: `["-a", "never"]`
 - `codex_exec_args`: `codex exec` 뒤에 붙는 추가 인자 배열
 - `main_commands.restart`: `main` bot이 `/restart`에서 실행할 argv 배열
 - `main_commands.restart_staging`: `main` bot이 `/restart-staging`에서 실행할 argv 배열
@@ -162,6 +167,7 @@ LOG_LEVEL=INFO
 - `restart`, `restart-staging`, `deploy`는 `scripts/systemd-restart-service.sh`를 통해 서비스를 재시작합니다.
 - system service를 쓸 경우, bot 실행 사용자에게 passwordless sudo로 `systemctl restart codex-discord-staging`와 `systemctl restart codex-discord-main` 권한을 줘야 합니다.
 - thread별 Codex session id는 `staging/.codex-discord-state/staging-sessions.json`에 저장됩니다.
+- 승인 프롬프트를 끄려면 `codex_global_args`에 `["-a", "never"]`를 넣습니다. 이 경우 승인 질문은 사라지지만, sandbox 정책 때문에 막히는 작업은 여전히 실패할 수 있습니다.
 
 ## 실행
 

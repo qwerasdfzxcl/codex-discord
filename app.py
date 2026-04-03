@@ -304,6 +304,7 @@ class CodexDiscordBot(commands.Bot):
         self.tree.clear_commands(guild=guild)
 
         self.tree.add_command(ping_command, guild=guild)
+        self.tree.add_command(new_session_command, guild=guild)
         self.tree.add_command(ask_command, guild=guild)
         self.tree.add_command(status_command, guild=guild)
         self.tree.add_command(diff_command, guild=guild)
@@ -365,6 +366,21 @@ class CodexDiscordBot(commands.Bot):
         if workspace is None and require_thread:
             return channel, None
         return channel, workspace
+
+    def resolve_session_parent_channel(self, interaction: discord.Interaction) -> tuple[discord.TextChannel | None, Path | None]:
+        channel = interaction.channel
+        if isinstance(channel, discord.Thread):
+            parent = channel.parent
+            if not isinstance(parent, discord.TextChannel):
+                return None, None
+            workspace = self.config.channel_workspaces.get(parent.id)
+            return parent, workspace
+
+        if isinstance(channel, discord.TextChannel):
+            workspace = self.config.channel_workspaces.get(channel.id)
+            return channel, workspace
+
+        return None, None
 
     async def ensure_thread_binding(self, interaction: discord.Interaction, thread: discord.Thread) -> bool:
         bound_role, _ = split_thread_binding(thread.name)
@@ -763,6 +779,49 @@ class CodexDiscordBot(commands.Bot):
             f"pong\nrole: {self.config.bot_role}\nlatency_ms: {latency_ms}"
         )
 
+    async def handle_new_session(self, interaction: discord.Interaction, target_bot_role: str, title: str) -> None:
+        if not await self.ensure_allowed_or_reply(interaction):
+            return
+
+        parent_channel, workspace = self.resolve_session_parent_channel(interaction)
+        if parent_channel is None:
+            await interaction.response.send_message(
+                "`/new_session` must be used in a mapped text channel or a thread under one.",
+                ephemeral=True,
+            )
+            return
+        if workspace is None:
+            await interaction.response.send_message(
+                "This channel is not mapped to a workspace.",
+                ephemeral=True,
+            )
+            return
+
+        thread_name = format_thread_binding_name(target_bot_role, title)
+        try:
+            thread = await parent_channel.create_thread(
+                name=thread_name,
+                auto_archive_duration=1440,
+                type=discord.ChannelType.public_thread,
+                reason=f"New Codex session for {target_bot_role}",
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "Unable to create a thread in this channel. Check the bot's thread permissions.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as exc:
+            await interaction.response.send_message(
+                f"Unable to create a new session thread: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Created session for `{target_bot_role}`: {thread.mention}\nworkspace: {workspace}"
+        )
+
     async def handle_ask(self, interaction: discord.Interaction, prompt: str) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
@@ -847,6 +906,23 @@ def get_bot_from_interaction(interaction: discord.Interaction) -> CodexDiscordBo
 async def ping_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_ping(interaction)
+
+
+@app_commands.command(name="new_session", description="Create a new session thread bound to a selected bot.")
+@app_commands.describe(target_bot_role="Which bot should own the new session", title="Thread title for the new session")
+@app_commands.choices(
+    target_bot_role=[
+        app_commands.Choice(name="staging", value="staging"),
+        app_commands.Choice(name="main", value="main"),
+    ]
+)
+async def new_session_command(
+    interaction: discord.Interaction,
+    target_bot_role: app_commands.Choice[str],
+    title: str,
+) -> None:
+    bot = get_bot_from_interaction(interaction)
+    await bot.handle_new_session(interaction, target_bot_role.value, title)
 
 
 @app_commands.command(name="ask", description="Run Codex for the current mapped thread.")

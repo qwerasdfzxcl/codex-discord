@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ class AppConfig:
     token: str
     allowed_user_id: int
     checkout_path: Path
+    config_path: Path
     guild_id: int | None
     channel_workspaces: dict[int, Path]
     timeout_seconds: int
@@ -90,6 +92,14 @@ class PendingApproval:
     method: str
     params: dict[str, object]
     requested_at: str
+
+
+@dataclass
+class PendingRepoDeletion:
+    channel_id: int
+    workspace: Path
+    requested_at: str
+    requested_by_user_id: int
 
 
 @dataclass
@@ -199,6 +209,12 @@ def output_title_for_prefix(filename_prefix: str) -> str:
     if filename_prefix == "deploy":
         return "배포 결과"
     return "실행 결과"
+
+
+def normalize_repo_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9._-]+", "-", name.strip().lower())
+    slug = slug.strip("-.")
+    return slug[:90]
 
 
 def truncate_text(text: str, limit: int) -> str:
@@ -394,6 +410,7 @@ def load_app_config() -> AppConfig:
         token=str(env_settings["token"]),
         allowed_user_id=int(env_settings["allowed_user_id"]),
         checkout_path=env_settings["checkout_path"],
+        config_path=config_path,
         guild_id=env_settings["guild_id"],
         channel_workspaces=channel_workspaces,
         timeout_seconds=timeout_seconds,
@@ -519,6 +536,51 @@ class AppServerApprovalView(discord.ui.View):
         button: discord.ui.Button,
     ) -> None:
         await self.bot.handle_app_server_approval_click(interaction, self.approval_id, approved=False, view=self)
+
+
+class DeleteRepoConfirmationView(discord.ui.View):
+    def __init__(self, bot: "CodexDiscordBot", deletion_id: str) -> None:
+        super().__init__(timeout=1800)
+        self.bot = bot
+        self.deletion_id = deletion_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        pending = self.bot.pending_repo_deletions.get(self.deletion_id)
+        if pending is None:
+            await self.bot.send_interaction_embed(
+                interaction,
+                title="삭제 요청 만료",
+                description="이 삭제 요청은 더 이상 유효하지 않아요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return False
+        if interaction.user.id != pending.requested_by_user_id:
+            await self.bot.send_interaction_embed(
+                interaction,
+                title="삭제 권한 없음",
+                description="이 삭제 요청을 시작한 사용자만 최종 삭제를 진행할 수 있어요.",
+                tone="error",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="최종 삭제", style=discord.ButtonStyle.danger)
+    async def confirm(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.bot.handle_delete_repo_confirmation(interaction, self.deletion_id, confirmed=True, view=self)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.bot.handle_delete_repo_confirmation(interaction, self.deletion_id, confirmed=False, view=self)
 
 
 class ThreadSessionRuntime:
@@ -832,6 +894,7 @@ class CodexDiscordBot(commands.Bot):
         self.thread_locks: dict[int, asyncio.Lock] = {}
         self.session_runtimes: dict[int, ThreadSessionRuntime] = {}
         self.pending_approvals: dict[str, PendingApproval] = {}
+        self.pending_repo_deletions: dict[str, PendingRepoDeletion] = {}
         self.background_notifications_task: asyncio.Task[None] | None = None
         self.background_notifications_lock = asyncio.Lock()
         self.last_execution: ExecutionRecord | None = None
@@ -953,6 +1016,8 @@ class CodexDiscordBot(commands.Bot):
 
         ping_command.name = command_name_for_role("ping", self.config.bot_role)
         new_session_command.name = command_name_for_role("new-session", self.config.bot_role)
+        new_repo_command.name = command_name_for_role("new-repo", self.config.bot_role)
+        delete_repo_command.name = command_name_for_role("delete-repo", self.config.bot_role)
         status_command.name = command_name_for_role("status", self.config.bot_role)
         diff_command.name = command_name_for_role("diff", self.config.bot_role)
         restart_command.name = "restart"
@@ -961,6 +1026,8 @@ class CodexDiscordBot(commands.Bot):
 
         self.tree.add_command(ping_command, guild=guild)
         self.tree.add_command(new_session_command, guild=guild)
+        self.tree.add_command(new_repo_command, guild=guild)
+        self.tree.add_command(delete_repo_command, guild=guild)
         self.tree.add_command(status_command, guild=guild)
         self.tree.add_command(diff_command, guild=guild)
 
@@ -1088,6 +1155,56 @@ class CodexDiscordBot(commands.Bot):
         if status == "pending":
             return "대기 중"
         return status
+
+    def resolve_repo_creation_base(self) -> Path:
+        return self.config.checkout_path.resolve().parent.parent
+
+    def resolve_config_sync_paths(self) -> list[Path]:
+        paths = [self.config.config_path.resolve()]
+        if is_relative_to(self.config.config_path, self.config.checkout_path):
+            relative = self.config.config_path.resolve().relative_to(self.config.checkout_path.resolve())
+            for role in ("main", "staging"):
+                candidate = (self.config.checkout_path.parent / role / relative).resolve()
+                if candidate not in paths and candidate.is_file():
+                    paths.append(candidate)
+        return paths
+
+    def persist_channel_mapping(self, channel_id: int, workspace: Path) -> list[Path]:
+        updated_paths: list[Path] = []
+        for config_path in self.resolve_config_sync_paths():
+            with config_path.open("r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            channels = raw.get("channels")
+            if not isinstance(channels, dict):
+                raise ConfigError(f"`channels` 항목이 올바르지 않습니다: {config_path}")
+            channels[str(channel_id)] = str(workspace)
+            config_path.write_text(json.dumps(raw, indent=2, sort_keys=True), encoding="utf-8")
+            updated_paths.append(config_path)
+        self.config.channel_workspaces[channel_id] = workspace
+        return updated_paths
+
+    def remove_channel_mapping(self, channel_id: int) -> list[Path]:
+        updated_paths: list[Path] = []
+        for config_path in self.resolve_config_sync_paths():
+            with config_path.open("r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            channels = raw.get("channels")
+            if not isinstance(channels, dict):
+                raise ConfigError(f"`channels` 항목이 올바르지 않습니다: {config_path}")
+            channels.pop(str(channel_id), None)
+            config_path.write_text(json.dumps(raw, indent=2, sort_keys=True), encoding="utf-8")
+            updated_paths.append(config_path)
+        self.config.channel_workspaces.pop(channel_id, None)
+        return updated_paths
+
+    def is_protected_workspace(self, workspace: Path) -> bool:
+        resolved = workspace.resolve()
+        project_root = self.config.checkout_path.resolve().parent
+        if resolved == project_root:
+            return True
+        if is_relative_to(resolved, project_root):
+            return True
+        return False
 
     def background_operations_dir(self) -> Path:
         return self.config.checkout_path / STATE_DIRECTORY_NAME / BACKGROUND_OPERATIONS_DIR_NAME
@@ -2099,6 +2216,275 @@ class CodexDiscordBot(commands.Bot):
             tone="success",
         )
 
+    async def handle_new_repo(self, interaction: discord.Interaction, name: str) -> None:
+        if not await self.ensure_allowed_or_reply(interaction):
+            return
+        if not await self.ensure_channel_only(interaction, command_name_for_role("new-repo", self.config.bot_role)):
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await self.send_interaction_embed(
+                interaction,
+                title="채널에서만 사용 가능",
+                description="새 레포는 일반 텍스트 채널에서만 만들 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        repo_name = normalize_repo_name(name)
+        if not repo_name:
+            await self.send_interaction_embed(
+                interaction,
+                title="이름 형식 오류",
+                description="레포 이름에는 영문, 숫자, `.`, `_`, `-`만 사용할 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await self.send_interaction_embed(
+                interaction,
+                title="Guild 정보 없음",
+                description="서버 안에서만 새 채널을 만들 수 있어요.",
+                tone="error",
+                ephemeral=True,
+            )
+            return
+
+        if discord.utils.get(guild.text_channels, name=repo_name) is not None:
+            await self.send_interaction_embed(
+                interaction,
+                title="채널 이름 중복",
+                description=f"`#{repo_name}` 채널이 이미 존재해요. 다른 이름을 사용해 주세요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        repo_root = self.resolve_repo_creation_base()
+        repo_path = (repo_root / repo_name).resolve()
+        if repo_path.exists():
+            await self.send_interaction_embed(
+                interaction,
+                title="레포 경로 중복",
+                description=f"`{repo_path}` 경로가 이미 존재해요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        created_channel: discord.TextChannel | None = None
+        created_repo = False
+        try:
+            repo_path.mkdir(parents=True, exist_ok=False)
+            created_repo = True
+
+            init_result = await self.run_process(
+                ["git", "init", "-b", "main", str(repo_path)],
+                cwd=repo_root,
+                timeout_seconds=30,
+            )
+            if init_result.timed_out or init_result.returncode != 0:
+                raise RuntimeError(init_result.stderr or init_result.stdout or "git init failed")
+
+            created_channel = await guild.create_text_channel(
+                name=repo_name,
+                category=channel.category,
+                topic=f"workspace: {repo_path}",
+                overwrites=channel.overwrites,
+                reason=f"새 Git 레포/채널 생성: {repo_name}",
+            )
+
+            updated_paths = self.persist_channel_mapping(created_channel.id, repo_path)
+        except Exception as exc:
+            if created_channel is not None:
+                try:
+                    await created_channel.delete(reason=f"새 Git 레포 생성 롤백: {repo_name}")
+                except discord.HTTPException:
+                    logging.exception("Failed to roll back created channel %s", created_channel.id)
+            if created_repo and repo_path.exists():
+                shutil.rmtree(repo_path, ignore_errors=True)
+            logging.exception("Failed to create repo/channel for %s", repo_name)
+            await self.send_interaction_embed(
+                interaction,
+                title="레포 생성 실패",
+                description=f"새 레포와 채널을 만들지 못했어요.\n`{exc}`",
+                tone="error",
+            )
+            return
+
+        await self.send_interaction_embed(
+            interaction,
+            title="레포 생성 완료",
+            description=(
+                f"채널: {created_channel.mention}\n"
+                f"레포 경로: `{repo_path}`\n"
+                f"초기 브랜치: `main`\n"
+                f"설정 반영: {', '.join(str(path) for path in updated_paths)}\n"
+                "이미 실행 중인 다른 봇 프로세스는 재시작 전까지 새 채널 매핑을 바로 인식하지 못할 수 있어요."
+            ),
+            tone="success",
+        )
+
+    async def handle_delete_repo(self, interaction: discord.Interaction, confirm_name: str) -> None:
+        if not await self.ensure_allowed_or_reply(interaction):
+            return
+        if not await self.ensure_channel_only(interaction, command_name_for_role("delete-repo", self.config.bot_role)):
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await self.send_interaction_embed(
+                interaction,
+                title="채널에서만 사용 가능",
+                description="삭제는 일반 텍스트 채널에서만 시작할 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        workspace = self.config.channel_workspaces.get(channel.id)
+        if workspace is None:
+            await self.send_interaction_embed(
+                interaction,
+                title="삭제 대상 없음",
+                description="이 채널은 레포 워크스페이스에 매핑되어 있지 않아요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        if self.is_protected_workspace(workspace):
+            await self.send_interaction_embed(
+                interaction,
+                title="보호된 워크스페이스",
+                description=(
+                    f"`{workspace}` 는 bot 운영용 경로라서 `/delete-repo`로 삭제할 수 없어요.\n"
+                    "codex-discord 자체 checkout과 그 내부 경로는 보호됩니다."
+                ),
+                tone="error",
+                ephemeral=True,
+            )
+            return
+
+        expected = channel.name.strip()
+        if confirm_name.strip() != expected:
+            await self.send_interaction_embed(
+                interaction,
+                title="확인 이름 불일치",
+                description=(
+                    "삭제 확인을 위해 현재 채널 이름을 정확히 다시 입력해야 해요.\n"
+                    f"입력값: `{confirm_name.strip() or '(비어 있음)'}`\n"
+                    f"기대값: `{expected}`"
+                ),
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        deletion_id = f"{channel.id}:{uuid.uuid4().hex[:10]}"
+        self.pending_repo_deletions[deletion_id] = PendingRepoDeletion(
+            channel_id=channel.id,
+            workspace=workspace.resolve(),
+            requested_at=now_utc_iso(),
+            requested_by_user_id=interaction.user.id,
+        )
+        view = DeleteRepoConfirmationView(self, deletion_id)
+        await self.send_interaction_embed(
+            interaction,
+            title="레포 삭제 최종 확인",
+            description=(
+                "이 작업은 되돌릴 수 없어요.\n"
+                f"삭제 대상 채널: {channel.mention}\n"
+                f"삭제 대상 경로: `{workspace.resolve()}`\n"
+                f"확인 일치: `{expected}`\n"
+                "아래 `최종 삭제` 버튼을 눌러야 실제로 삭제됩니다."
+            ),
+            tone="error",
+            ephemeral=True,
+            view=view,
+        )
+
+    async def handle_delete_repo_confirmation(
+        self,
+        interaction: discord.Interaction,
+        deletion_id: str,
+        confirmed: bool,
+        view: DeleteRepoConfirmationView,
+    ) -> None:
+        pending = self.pending_repo_deletions.pop(deletion_id, None)
+        if pending is None:
+            self.disable_view_buttons(view)
+            embed = self.build_embed("삭제 요청 만료", "이 삭제 요청은 더 이상 유효하지 않아요.", tone="warning")
+            await interaction.response.edit_message(embed=embed, view=view, content=None)
+            return
+
+        self.disable_view_buttons(view)
+        if not confirmed:
+            embed = self.build_embed("삭제 취소됨", "레포와 채널 삭제를 취소했어요.", tone="success")
+            await interaction.response.edit_message(embed=embed, view=view, content=None)
+            return
+
+        channel = self.get_channel(pending.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(pending.channel_id)
+            except discord.HTTPException:
+                channel = None
+        if not isinstance(channel, discord.TextChannel):
+            embed = self.build_embed("채널 조회 실패", "삭제 대상 채널을 찾지 못했어요.", tone="error")
+            await interaction.response.edit_message(embed=embed, view=view, content=None)
+            return
+
+        workspace = pending.workspace.resolve()
+        if self.is_protected_workspace(workspace):
+            embed = self.build_embed(
+                "보호된 워크스페이스",
+                f"`{workspace}` 는 보호된 경로라 삭제할 수 없어요.",
+                tone="error",
+            )
+            await interaction.response.edit_message(embed=embed, view=view, content=None)
+            return
+
+        try:
+            updated_paths = self.remove_channel_mapping(channel.id)
+            shutil.rmtree(workspace)
+        except Exception as exc:
+            logging.exception("Failed to delete repo/channel for %s", workspace)
+            try:
+                self.persist_channel_mapping(channel.id, workspace)
+            except Exception:
+                logging.exception("Failed to restore channel mapping for %s", workspace)
+            embed = self.build_embed(
+                "삭제 실패",
+                f"레포 삭제 또는 설정 정리 중 오류가 발생했어요.\n`{exc}`",
+                tone="error",
+            )
+            await interaction.response.edit_message(embed=embed, view=view, content=None)
+            return
+
+        embed = self.build_embed(
+            "삭제 완료",
+            (
+                f"레포 경로를 삭제했고 채널도 곧 정리합니다.\n"
+                f"삭제된 경로: `{workspace}`\n"
+                f"설정 반영: {', '.join(str(path) for path in updated_paths)}"
+            ),
+            tone="success",
+        )
+        await interaction.response.edit_message(embed=embed, view=view, content=None)
+        await asyncio.sleep(1)
+        try:
+            await channel.delete(reason=f"레포 삭제 완료: {workspace.name}")
+        except discord.HTTPException:
+            logging.exception("Failed to delete Discord channel %s after repo deletion", channel.id)
+
     async def handle_status(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
@@ -2228,6 +2614,20 @@ async def new_session_command(
 ) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_new_session(interaction, target_bot_role.value if target_bot_role else "main", title)
+
+
+@app_commands.command(name="new-repo", description="새 Git 레포와 대응 채널을 함께 만듭니다. 채널 전용.")
+@app_commands.describe(name="새 레포와 채널에 사용할 이름")
+async def new_repo_command(interaction: discord.Interaction, name: str) -> None:
+    bot = get_bot_from_interaction(interaction)
+    await bot.handle_new_repo(interaction, name)
+
+
+@app_commands.command(name="delete-repo", description="현재 채널에 연결된 Git 레포와 채널을 삭제합니다. 매우 위험합니다. 채널 전용.")
+@app_commands.describe(confirm_name="확인용으로 현재 채널 이름을 정확히 다시 입력")
+async def delete_repo_command(interaction: discord.Interaction, confirm_name: str) -> None:
+    bot = get_bot_from_interaction(interaction)
+    await bot.handle_delete_repo(interaction, confirm_name)
 
 
 @app_commands.command(name="status", description="봇 역할, 체크아웃, 최근 상태를 보여줍니다. 스레드 전용.")

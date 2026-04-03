@@ -1399,18 +1399,39 @@ class CodexDiscordBot(commands.Bot):
 
     async def spawn_main_operation(self, command_name: str, args: list[str]) -> None:
         await asyncio.sleep(1)
+        log_dir = self.config.checkout_path / STATE_DIRECTORY_NAME
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"latest-{command_name}.log"
         try:
-            await asyncio.create_subprocess_exec(
-                *args,
-                cwd=str(self.config.checkout_path),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                start_new_session=True,
+            with log_path.open("wb") as log_handle:
+                process = await asyncio.create_subprocess_exec(
+                    *args,
+                    cwd=str(self.config.checkout_path),
+                    stdout=log_handle,
+                    stderr=log_handle,
+                    start_new_session=True,
+                )
+            logging.info(
+                "Started background %s pid=%s log=%s",
+                command_name,
+                process.pid,
+                log_path,
             )
         except FileNotFoundError:
             logging.exception("Failed to start %s: missing executable %s", command_name, args[0])
         except Exception:
             logging.exception("Unexpected error while starting %s", command_name)
+
+    def format_background_operation_message(self, command_name: str, args: list[str]) -> str:
+        log_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"latest-{command_name}.log"
+        lines = [
+            f"{command_name} requested.",
+            f"command: {' '.join(args)}",
+            f"log: {log_path}",
+        ]
+        if command_name == "deploy":
+            lines.append("The main bot may restart before posting a final follow-up message.")
+        return "\n".join(lines)
 
     async def handle_ping(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
@@ -1523,9 +1544,7 @@ class CodexDiscordBot(commands.Bot):
             return
 
         self.record_execution("restart", "requested", self.config.checkout_path, 0.0, "restart requested")
-        await interaction.response.send_message(
-            f"Restart requested.\ncommand: {' '.join(self.config.restart_args)}"
-        )
+        await interaction.response.send_message(self.format_background_operation_message("restart", self.config.restart_args))
         asyncio.create_task(self.spawn_main_operation("restart", self.config.restart_args))
 
     async def handle_deploy(self, interaction: discord.Interaction) -> None:
@@ -1539,9 +1558,9 @@ class CodexDiscordBot(commands.Bot):
         if not await self.ensure_thread_owned(interaction):
             return
 
-        await interaction.response.defer(thinking=True)
-        result_text = await self.run_main_operation("deploy", self.config.deploy_args)
-        await self.send_output(interaction, result_text, filename_prefix="deploy")
+        self.record_execution("deploy", "requested", self.config.checkout_path, 0.0, "deploy requested")
+        await interaction.response.send_message(self.format_background_operation_message("deploy", self.config.deploy_args))
+        asyncio.create_task(self.spawn_main_operation("deploy", self.config.deploy_args))
 
 
 def get_bot_from_interaction(interaction: discord.Interaction) -> CodexDiscordBot:

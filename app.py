@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import sys
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,8 @@ DEFAULT_HISTORY_MESSAGES = 20
 DEFAULT_MAX_PROMPT_CHARS = 12000
 THREAD_BINDING_PATTERN = re.compile(r"^\[bot:(main|staging)\]\s*")
 STATE_DIRECTORY_NAME = ".codex-discord-state"
+BACKGROUND_OPERATIONS_DIR_NAME = "background-operations"
+BACKGROUND_OPERATION_POLL_SECONDS = 5
 
 
 class ConfigError(Exception):
@@ -80,6 +84,16 @@ class PendingApproval:
     method: str
     params: dict[str, object]
     requested_at: str
+
+
+@dataclass
+class BackgroundOperation:
+    operation_id: str
+    command_name: str
+    args: list[str]
+    target_channel_id: int
+    metadata_path: Path
+    log_path: Path
 
 
 def now_utc_iso() -> str:
@@ -751,6 +765,8 @@ class CodexDiscordBot(commands.Bot):
         self.thread_locks: dict[int, asyncio.Lock] = {}
         self.session_runtimes: dict[int, ThreadSessionRuntime] = {}
         self.pending_approvals: dict[str, PendingApproval] = {}
+        self.background_notifications_task: asyncio.Task[None] | None = None
+        self.background_notifications_lock = asyncio.Lock()
         self.last_execution: ExecutionRecord | None = None
         state_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"{self.config.bot_role}-app-server-threads.json"
         self.session_store = SessionStore(state_path)
@@ -786,6 +802,8 @@ class CodexDiscordBot(commands.Bot):
             logging.info("Synced global slash commands")
 
     async def on_ready(self) -> None:
+        if self.background_notifications_task is None or self.background_notifications_task.done():
+            self.background_notifications_task = asyncio.create_task(self.background_notification_loop())
         logging.info(
             "Logged in as %s role=%s checkout=%s",
             self.user,
@@ -858,6 +876,35 @@ class CodexDiscordBot(commands.Bot):
             started_at=now_utc_iso(),
             duration_seconds=duration_seconds,
             summary=summary,
+        )
+
+    def background_operations_dir(self) -> Path:
+        return self.config.checkout_path / STATE_DIRECTORY_NAME / BACKGROUND_OPERATIONS_DIR_NAME
+
+    def create_background_operation(self, command_name: str, args: list[str], target_channel_id: int) -> BackgroundOperation:
+        operations_dir = self.background_operations_dir()
+        operations_dir.mkdir(parents=True, exist_ok=True)
+        operation_id = f"{command_name}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+        metadata_path = operations_dir / f"{operation_id}.json"
+        log_path = operations_dir / f"{operation_id}.log"
+        payload = {
+            "operation_id": operation_id,
+            "command_name": command_name,
+            "args": list(args),
+            "target_channel_id": target_channel_id,
+            "status": "pending",
+            "requested_at": now_utc_iso(),
+            "notified": False,
+            "log_path": str(log_path),
+        }
+        metadata_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return BackgroundOperation(
+            operation_id=operation_id,
+            command_name=command_name,
+            args=list(args),
+            target_channel_id=target_channel_id,
+            metadata_path=metadata_path,
+            log_path=log_path,
         )
 
     def get_thread_lock(self, thread_id: int) -> asyncio.Lock:
@@ -1397,41 +1444,121 @@ class CodexDiscordBot(commands.Bot):
             lines.append("(no output)")
         return "\n".join(lines)
 
-    async def spawn_main_operation(self, command_name: str, args: list[str]) -> None:
+    async def spawn_main_operation(self, operation: BackgroundOperation) -> None:
         await asyncio.sleep(1)
-        log_dir = self.config.checkout_path / STATE_DIRECTORY_NAME
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"latest-{command_name}.log"
+        runner_script = self.config.checkout_path / "scripts" / "background_operation_runner.py"
+        unit_name = f"codex-discord-bg-{operation.operation_id}"
         try:
-            with log_path.open("wb") as log_handle:
-                process = await asyncio.create_subprocess_exec(
-                    *args,
-                    cwd=str(self.config.checkout_path),
-                    stdout=log_handle,
-                    stderr=log_handle,
-                    start_new_session=True,
-                )
+            process = await asyncio.create_subprocess_exec(
+                "systemd-run",
+                "--user",
+                "--unit",
+                unit_name,
+                "--collect",
+                "--no-block",
+                "--quiet",
+                "--working-directory",
+                str(self.config.checkout_path),
+                sys.executable,
+                str(runner_script),
+                str(operation.metadata_path),
+                str(operation.log_path),
+                str(self.config.checkout_path),
+                *operation.args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
             logging.info(
-                "Started background %s pid=%s log=%s",
-                command_name,
+                "Started background %s pid=%s unit=%s log=%s",
+                operation.command_name,
                 process.pid,
-                log_path,
+                unit_name,
+                operation.log_path,
             )
         except FileNotFoundError:
-            logging.exception("Failed to start %s: missing executable %s", command_name, args[0])
+            logging.exception("Failed to start %s: missing executable %s", operation.command_name, operation.args[0])
         except Exception:
-            logging.exception("Unexpected error while starting %s", command_name)
+            logging.exception("Unexpected error while starting %s", operation.command_name)
 
-    def format_background_operation_message(self, command_name: str, args: list[str]) -> str:
-        log_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"latest-{command_name}.log"
+    def format_background_operation_message(self, operation: BackgroundOperation) -> str:
         lines = [
-            f"{command_name} requested.",
-            f"command: {' '.join(args)}",
-            f"log: {log_path}",
+            f"{operation.command_name} requested.",
+            f"command: {' '.join(operation.args)}",
+            f"log: {operation.log_path}",
         ]
-        if command_name == "deploy":
+        if operation.command_name == "deploy":
             lines.append("The main bot may restart before posting a final follow-up message.")
         return "\n".join(lines)
+
+    async def background_notification_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self.process_completed_background_operations()
+            except Exception:
+                logging.exception("Failed while processing background operation notifications")
+            await asyncio.sleep(BACKGROUND_OPERATION_POLL_SECONDS)
+
+    async def process_completed_background_operations(self) -> None:
+        async with self.background_notifications_lock:
+            operations_dir = self.background_operations_dir()
+            if not operations_dir.is_dir():
+                return
+            for metadata_path in sorted(operations_dir.glob("*.json")):
+                try:
+                    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    logging.exception("Failed to read background operation metadata %s", metadata_path)
+                    continue
+
+                if payload.get("notified") is True:
+                    continue
+                if payload.get("status") not in {"succeeded", "failed"}:
+                    continue
+
+                channel_id = payload.get("target_channel_id")
+                if not isinstance(channel_id, int):
+                    logging.warning("Background operation metadata missing target_channel_id: %s", metadata_path)
+                    continue
+
+                channel = self.get_channel(channel_id)
+                if channel is None:
+                    try:
+                        channel = await self.fetch_channel(channel_id)
+                    except discord.HTTPException:
+                        logging.exception("Failed to fetch background operation target channel %s", channel_id)
+                        continue
+                if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    logging.warning("Unsupported background operation target channel type: %s", channel_id)
+                    continue
+
+                command_name = payload.get("command_name", "operation")
+                status = payload.get("status", "failed")
+                returncode = payload.get("returncode")
+                log_path = payload.get("log_path", str(metadata_path.with_suffix(".log")))
+                command_args = payload.get("args", [])
+                error_message = payload.get("error_message")
+                lines = [
+                    f"{command_name} completed.",
+                    f"status: {status}",
+                ]
+                if isinstance(returncode, int):
+                    lines.append(f"exit code: {returncode}")
+                if isinstance(command_args, list) and all(isinstance(item, str) for item in command_args):
+                    lines.append(f"command: {' '.join(command_args)}")
+                lines.append(f"log: {log_path}")
+                if isinstance(error_message, str) and error_message.strip():
+                    lines.append(f"error: {error_message}")
+
+                try:
+                    await channel.send("\n".join(lines))
+                except discord.HTTPException:
+                    logging.exception("Failed to send background operation completion message to channel %s", channel_id)
+                    continue
+
+                payload["notified"] = True
+                payload["notified_at"] = now_utc_iso()
+                metadata_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
     async def handle_ping(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
@@ -1544,8 +1671,9 @@ class CodexDiscordBot(commands.Bot):
             return
 
         self.record_execution("restart", "requested", self.config.checkout_path, 0.0, "restart requested")
-        await interaction.response.send_message(self.format_background_operation_message("restart", self.config.restart_args))
-        asyncio.create_task(self.spawn_main_operation("restart", self.config.restart_args))
+        operation = self.create_background_operation("restart", self.config.restart_args, interaction.channel_id)
+        await interaction.response.send_message(self.format_background_operation_message(operation))
+        asyncio.create_task(self.spawn_main_operation(operation))
 
     async def handle_deploy(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
@@ -1559,8 +1687,9 @@ class CodexDiscordBot(commands.Bot):
             return
 
         self.record_execution("deploy", "requested", self.config.checkout_path, 0.0, "deploy requested")
-        await interaction.response.send_message(self.format_background_operation_message("deploy", self.config.deploy_args))
-        asyncio.create_task(self.spawn_main_operation("deploy", self.config.deploy_args))
+        operation = self.create_background_operation("deploy", self.config.deploy_args, interaction.channel_id)
+        await interaction.response.send_message(self.format_background_operation_message(operation))
+        asyncio.create_task(self.spawn_main_operation(operation))
 
 
 def get_bot_from_interaction(interaction: discord.Interaction) -> CodexDiscordBot:

@@ -107,6 +107,12 @@ def format_thread_binding_name(bot_role: str, current_name: str) -> str:
     return prefix + normalized_base_name[:remaining].rstrip()
 
 
+def command_name_for_role(base_name: str, bot_role: str) -> str:
+    if bot_role == "staging":
+        return f"{base_name}-staging"
+    return base_name
+
+
 def parse_command_args(name: str, value: object, default: list[str] | None = None) -> list[str]:
     if value is None:
         return list(default or [])
@@ -293,6 +299,14 @@ class CodexDiscordBot(commands.Bot):
         self.tree.on_error = self.on_tree_error
         self.tree.clear_commands(guild=guild)
 
+        ping_command.name = command_name_for_role("ping", self.config.bot_role)
+        new_session_command.name = command_name_for_role("new-session", self.config.bot_role)
+        ask_command.name = command_name_for_role("ask", self.config.bot_role)
+        status_command.name = command_name_for_role("status", self.config.bot_role)
+        diff_command.name = command_name_for_role("diff", self.config.bot_role)
+        restart_staging_command.name = "restart-staging"
+        deploy_command.name = "deploy"
+
         self.tree.add_command(ping_command, guild=guild)
         self.tree.add_command(new_session_command, guild=guild)
         self.tree.add_command(ask_command, guild=guild)
@@ -418,6 +432,26 @@ class CodexDiscordBot(commands.Bot):
         else:
             await interaction.response.send_message(message, ephemeral=True)
         return False
+
+    async def ensure_channel_only(self, interaction: discord.Interaction, command_name: str) -> bool:
+        if isinstance(interaction.channel, discord.Thread):
+            message = f"`/{command_name}` can only be used in a parent channel, not inside a thread."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return False
+        return True
+
+    async def ensure_thread_only(self, interaction: discord.Interaction, command_name: str) -> bool:
+        if not isinstance(interaction.channel, discord.Thread):
+            message = f"`/{command_name}` can only be used inside a thread."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return False
+        return True
 
     async def send_output(self, interaction: discord.Interaction, text: str, filename_prefix: str) -> None:
         if len(text) > DISCORD_FILE_FALLBACK_LIMIT:
@@ -762,6 +796,8 @@ class CodexDiscordBot(commands.Bot):
     async def handle_ping(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
+        if not await self.ensure_channel_only(interaction, command_name_for_role("ping", self.config.bot_role)):
+            return
 
         latency_ms = round(self.latency * 1000)
         await interaction.response.send_message(
@@ -771,11 +807,13 @@ class CodexDiscordBot(commands.Bot):
     async def handle_new_session(self, interaction: discord.Interaction, target_bot_role: str, title: str) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
+        if not await self.ensure_channel_only(interaction, command_name_for_role("new-session", self.config.bot_role)):
+            return
 
         parent_channel, workspace = self.resolve_session_parent_channel(interaction)
         if parent_channel is None:
             await interaction.response.send_message(
-                "`/new_session` must be used in a mapped text channel or a thread under one.",
+                f"`/{command_name_for_role('new-session', self.config.bot_role)}` must be used in a mapped parent channel.",
                 ephemeral=True,
             )
             return
@@ -814,6 +852,8 @@ class CodexDiscordBot(commands.Bot):
     async def handle_ask(self, interaction: discord.Interaction, prompt: str) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
+        if not await self.ensure_thread_only(interaction, command_name_for_role("ask", self.config.bot_role)):
+            return
 
         thread, workspace = self.resolve_thread_workspace(interaction, require_thread=True)
         if thread is None:
@@ -839,6 +879,8 @@ class CodexDiscordBot(commands.Bot):
     async def handle_status(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
+        if not await self.ensure_thread_only(interaction, command_name_for_role("status", self.config.bot_role)):
+            return
 
         thread, _ = self.resolve_thread_workspace(interaction, require_thread=False)
         if thread is not None and not await self.ensure_thread_binding(interaction, thread):
@@ -850,6 +892,8 @@ class CodexDiscordBot(commands.Bot):
 
     async def handle_diff(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
+            return
+        if not await self.ensure_thread_only(interaction, command_name_for_role("diff", self.config.bot_role)):
             return
 
         thread, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
@@ -865,7 +909,9 @@ class CodexDiscordBot(commands.Bot):
         if not await self.ensure_allowed_or_reply(interaction):
             return
         if self.config.bot_role != "main":
-            await interaction.response.send_message("`/restart_staging` is only available on the main bot.", ephemeral=True)
+            await interaction.response.send_message("`/restart-staging` is only available on the main bot.", ephemeral=True)
+            return
+        if not await self.ensure_thread_only(interaction, "restart-staging"):
             return
 
         await interaction.response.defer(thinking=True)
@@ -877,6 +923,8 @@ class CodexDiscordBot(commands.Bot):
             return
         if self.config.bot_role != "main":
             await interaction.response.send_message("`/deploy` is only available on the main bot.", ephemeral=True)
+            return
+        if not await self.ensure_thread_only(interaction, "deploy"):
             return
 
         await interaction.response.defer(thinking=True)
@@ -891,13 +939,13 @@ def get_bot_from_interaction(interaction: discord.Interaction) -> CodexDiscordBo
     return client
 
 
-@app_commands.command(name="ping", description="Check whether the bot is alive.")
+@app_commands.command(name="ping", description="Check whether the bot is alive. Channel only.")
 async def ping_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_ping(interaction)
 
 
-@app_commands.command(name="new_session", description="Create a new session thread bound to a selected bot.")
+@app_commands.command(name="new-session", description="Create a new session thread bound to a selected bot. Channel only.")
 @app_commands.describe(target_bot_role="Which bot should own the new session", title="Thread title for the new session")
 @app_commands.choices(
     target_bot_role=[
@@ -914,32 +962,32 @@ async def new_session_command(
     await bot.handle_new_session(interaction, target_bot_role.value, title)
 
 
-@app_commands.command(name="ask", description="Run Codex for the current mapped thread.")
+@app_commands.command(name="ask", description="Run Codex for the current mapped thread. Thread only.")
 @app_commands.describe(prompt="Request to send to Codex")
 async def ask_command(interaction: discord.Interaction, prompt: str) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_ask(interaction, prompt)
 
 
-@app_commands.command(name="status", description="Show bot role, checkout, and recent status.")
+@app_commands.command(name="status", description="Show bot role, checkout, and recent status. Thread only.")
 async def status_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_status(interaction)
 
 
-@app_commands.command(name="diff", description="Show changed files and diff stat for the current workspace or checkout.")
+@app_commands.command(name="diff", description="Show changed files and diff stat for the current workspace or checkout. Thread only.")
 async def diff_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_diff(interaction)
 
 
-@app_commands.command(name="restart_staging", description="Restart the staging bot service. Main bot only.")
+@app_commands.command(name="restart-staging", description="Restart the staging bot service. Main bot only. Thread only.")
 async def restart_staging_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_restart_staging(interaction)
 
 
-@app_commands.command(name="deploy", description="Run the configured deploy script. Main bot only.")
+@app_commands.command(name="deploy", description="Run the configured deploy script. Main bot only. Thread only.")
 async def deploy_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_deploy(interaction)

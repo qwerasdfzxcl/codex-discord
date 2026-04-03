@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,9 +16,11 @@ from dotenv import load_dotenv
 
 DISCORD_MESSAGE_LIMIT = 1900
 DISCORD_FILE_FALLBACK_LIMIT = 8000
+DISCORD_THREAD_NAME_LIMIT = 100
 DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_HISTORY_MESSAGES = 20
 DEFAULT_MAX_PROMPT_CHARS = 12000
+THREAD_BINDING_PATTERN = re.compile(r"^\[bot:(main|staging)\]\s*")
 
 
 class ConfigError(Exception):
@@ -86,6 +89,23 @@ def chunk_text(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
         remaining = remaining[split_at:].lstrip("\n")
 
     return chunks
+
+
+def split_thread_binding(name: str) -> tuple[str | None, str]:
+    match = THREAD_BINDING_PATTERN.match(name)
+    if match is None:
+        return None, name.strip()
+    bound_role = match.group(1)
+    base_name = name[match.end() :].strip()
+    return bound_role, base_name
+
+
+def format_thread_binding_name(bot_role: str, current_name: str) -> str:
+    _, base_name = split_thread_binding(current_name)
+    prefix = f"[bot:{bot_role}] "
+    normalized_base_name = base_name or "session"
+    remaining = DISCORD_THREAD_NAME_LIMIT - len(prefix)
+    return prefix + normalized_base_name[:remaining].rstrip()
 
 
 def parse_command_args(name: str, value: object, default: list[str] | None = None) -> list[str]:
@@ -345,6 +365,42 @@ class CodexDiscordBot(commands.Bot):
         if workspace is None and require_thread:
             return channel, None
         return channel, workspace
+
+    async def ensure_thread_binding(self, interaction: discord.Interaction, thread: discord.Thread) -> bool:
+        bound_role, _ = split_thread_binding(thread.name)
+        if bound_role == self.config.bot_role:
+            return True
+
+        if bound_role is not None and bound_role != self.config.bot_role:
+            message = (
+                f"This thread is bound to the `{bound_role}` bot. "
+                f"Use the `{bound_role}` bot here, or create a new thread for `{self.config.bot_role}`."
+            )
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return False
+
+        new_name = format_thread_binding_name(self.config.bot_role, thread.name)
+        try:
+            await thread.edit(name=new_name)
+        except discord.Forbidden:
+            message = "Unable to bind this thread to a bot because the bot cannot rename the thread."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return False
+        except discord.HTTPException as exc:
+            message = f"Unable to bind this thread to a bot: {exc}"
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return False
+
+        return True
 
     async def ensure_allowed_or_reply(self, interaction: discord.Interaction) -> bool:
         if self.is_allowed_user(interaction.user.id):
@@ -718,6 +774,8 @@ class CodexDiscordBot(commands.Bot):
         if workspace is None:
             await interaction.response.send_message("This thread's parent channel is not mapped to a workspace.", ephemeral=True)
             return
+        if not await self.ensure_thread_binding(interaction, thread):
+            return
 
         lock = self.get_thread_lock(thread.id)
         if lock.locked():
@@ -734,6 +792,10 @@ class CodexDiscordBot(commands.Bot):
         if not await self.ensure_allowed_or_reply(interaction):
             return
 
+        thread, _ = self.resolve_thread_workspace(interaction, require_thread=False)
+        if thread is not None and not await self.ensure_thread_binding(interaction, thread):
+            return
+
         await interaction.response.defer(thinking=True)
         status_text = await self.build_status_text(interaction)
         await self.send_output(interaction, status_text, filename_prefix="status")
@@ -742,7 +804,9 @@ class CodexDiscordBot(commands.Bot):
         if not await self.ensure_allowed_or_reply(interaction):
             return
 
-        _, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
+        thread, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
+        if thread is not None and not await self.ensure_thread_binding(interaction, thread):
+            return
         target_path = workspace or self.config.checkout_path
 
         await interaction.response.defer(thinking=True)

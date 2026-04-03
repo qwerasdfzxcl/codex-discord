@@ -99,9 +99,16 @@ def split_thread_binding(name: str) -> tuple[str | None, str]:
     return bound_role, base_name
 
 
+def thread_target_role(name: str) -> str:
+    bound_role, _ = split_thread_binding(name)
+    if bound_role == "staging":
+        return "staging"
+    return "main"
+
+
 def format_thread_binding_name(bot_role: str, current_name: str) -> str:
     _, base_name = split_thread_binding(current_name)
-    prefix = f"[bot:{bot_role}] "
+    prefix = "[bot:staging] " if bot_role == "staging" else ""
     normalized_base_name = base_name or "session"
     remaining = DISCORD_THREAD_NAME_LIMIT - len(prefix)
     return prefix + normalized_base_name[:remaining].rstrip()
@@ -288,6 +295,7 @@ class CodexDiscordBot(commands.Bot):
         intents = discord.Intents.default()
         intents.guilds = True
         intents.messages = True
+        intents.message_content = True
 
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
@@ -301,7 +309,6 @@ class CodexDiscordBot(commands.Bot):
 
         ping_command.name = command_name_for_role("ping", self.config.bot_role)
         new_session_command.name = command_name_for_role("new-session", self.config.bot_role)
-        ask_command.name = command_name_for_role("ask", self.config.bot_role)
         status_command.name = command_name_for_role("status", self.config.bot_role)
         diff_command.name = command_name_for_role("diff", self.config.bot_role)
         restart_staging_command.name = "restart-staging"
@@ -309,7 +316,6 @@ class CodexDiscordBot(commands.Bot):
 
         self.tree.add_command(ping_command, guild=guild)
         self.tree.add_command(new_session_command, guild=guild)
-        self.tree.add_command(ask_command, guild=guild)
         self.tree.add_command(status_command, guild=guild)
         self.tree.add_command(diff_command, guild=guild)
 
@@ -331,6 +337,32 @@ class CodexDiscordBot(commands.Bot):
             self.config.bot_role,
             self.config.checkout_path,
         )
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or self.user is None or message.author.id == self.user.id:
+            return
+        if message.author.id != self.config.allowed_user_id:
+            return
+        if not isinstance(message.channel, discord.Thread):
+            return
+
+        thread = message.channel
+        workspace = self.config.channel_workspaces.get(thread.parent_id or 0)
+        if workspace is None:
+            return
+        if thread_target_role(thread.name) != self.config.bot_role:
+            return
+
+        lock = self.get_thread_lock(thread.id)
+        if lock.locked():
+            await thread.send("A Codex task is already running in this thread. Wait for it to finish.")
+            return
+
+        async with lock:
+            async with thread.typing():
+                full_prompt = await self.build_thread_prompt(thread)
+                response_text = await self.run_codex(full_prompt, workspace)
+            await self.send_message_output(message, response_text, filename_prefix=f"message-{thread.id}")
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         logging.exception("Unhandled app command error", exc_info=error)
@@ -371,6 +403,26 @@ class CodexDiscordBot(commands.Bot):
             return channel, None
         return channel, workspace
 
+    async def ensure_thread_owned(self, interaction: discord.Interaction) -> bool:
+        channel = interaction.channel
+        if not isinstance(channel, discord.Thread):
+            return True
+
+        owner_role = thread_target_role(channel.name)
+        if owner_role == self.config.bot_role:
+            return True
+
+        expected_command_prefix = "" if owner_role == "main" else "-staging"
+        message = (
+            f"This thread belongs to the `{owner_role}` bot. "
+            f"Use the `{owner_role}` bot commands{expected_command_prefix} in this thread."
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return False
+
     def resolve_session_parent_channel(self, interaction: discord.Interaction) -> tuple[discord.TextChannel | None, Path | None]:
         channel = interaction.channel
         if isinstance(channel, discord.Thread):
@@ -385,42 +437,6 @@ class CodexDiscordBot(commands.Bot):
             return channel, workspace
 
         return None, None
-
-    async def ensure_thread_binding(self, interaction: discord.Interaction, thread: discord.Thread) -> bool:
-        bound_role, _ = split_thread_binding(thread.name)
-        if bound_role == self.config.bot_role:
-            return True
-
-        if bound_role is not None and bound_role != self.config.bot_role:
-            message = (
-                f"This thread is bound to the `{bound_role}` bot. "
-                f"Use the `{bound_role}` bot here, or create a new thread for `{self.config.bot_role}`."
-            )
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
-            return False
-
-        new_name = format_thread_binding_name(self.config.bot_role, thread.name)
-        try:
-            await thread.edit(name=new_name)
-        except discord.Forbidden:
-            message = "Unable to bind this thread to a bot because the bot cannot rename the thread."
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
-            return False
-        except discord.HTTPException as exc:
-            message = f"Unable to bind this thread to a bot: {exc}"
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
-            return False
-
-        return True
 
     async def ensure_allowed_or_reply(self, interaction: discord.Interaction) -> bool:
         if self.is_allowed_user(interaction.user.id):
@@ -474,6 +490,19 @@ class CodexDiscordBot(commands.Bot):
         for chunk in chunks[1:]:
             await interaction.followup.send(chunk)
 
+    async def send_message_output(self, source_message: discord.Message, text: str, filename_prefix: str) -> None:
+        if len(text) > DISCORD_FILE_FALLBACK_LIMIT:
+            filename = f"{filename_prefix}.txt"
+            file_data = io.BytesIO(text.encode("utf-8", errors="replace"))
+            file = discord.File(file_data, filename=filename)
+            await source_message.reply(f"Output was too long, attached as `{filename}`.", file=file, mention_author=False)
+            return
+
+        chunks = chunk_text(text)
+        await source_message.reply(chunks[0], mention_author=False)
+        for chunk in chunks[1:]:
+            await source_message.channel.send(chunk)
+
     async def run_process(self, args: list[str], cwd: Path, timeout_seconds: int | None = None) -> ProcessResult:
         timeout = timeout_seconds or self.config.timeout_seconds
         start = asyncio.get_running_loop().time()
@@ -508,11 +537,12 @@ class CodexDiscordBot(commands.Bot):
                 timed_out=True,
             )
 
-    async def build_thread_prompt(self, thread: discord.Thread, prompt: str) -> str:
+    async def build_thread_prompt(self, thread: discord.Thread) -> str:
         lines = [
             "You are running inside a Discord-driven Codex wrapper.",
             "The working directory is already set to the mapped development workspace.",
             "Only operate inside that workspace.",
+            "Respond to the latest user message in this thread while using prior thread messages as context.",
             "",
             f"Thread title: {thread.name}",
             f"Thread id: {thread.id}",
@@ -541,13 +571,6 @@ class CodexDiscordBot(commands.Bot):
             lines.append(f"[{role}] {item.author.display_name}:")
             lines.append(content)
             lines.append("")
-
-        lines.extend(
-            [
-                "Current user request:",
-                prompt,
-            ]
-        )
 
         full_prompt = "\n".join(lines).strip()
         if len(full_prompt) > self.config.max_prompt_chars:
@@ -824,13 +847,14 @@ class CodexDiscordBot(commands.Bot):
             )
             return
 
-        thread_name = format_thread_binding_name(target_bot_role, title)
+        resolved_target_role = target_bot_role or "main"
+        thread_name = format_thread_binding_name(resolved_target_role, title)
         try:
             thread = await parent_channel.create_thread(
                 name=thread_name,
                 auto_archive_duration=1440,
                 type=discord.ChannelType.public_thread,
-                reason=f"New Codex session for {target_bot_role}",
+                reason=f"New Codex session for {resolved_target_role}",
             )
         except discord.Forbidden:
             await interaction.response.send_message(
@@ -846,44 +870,15 @@ class CodexDiscordBot(commands.Bot):
             return
 
         await interaction.response.send_message(
-            f"Created session for `{target_bot_role}`: {thread.mention}\nworkspace: {workspace}"
+            f"Created session for `{resolved_target_role}`: {thread.mention}\nworkspace: {workspace}"
         )
-
-    async def handle_ask(self, interaction: discord.Interaction, prompt: str) -> None:
-        if not await self.ensure_allowed_or_reply(interaction):
-            return
-        if not await self.ensure_thread_only(interaction, command_name_for_role("ask", self.config.bot_role)):
-            return
-
-        thread, workspace = self.resolve_thread_workspace(interaction, require_thread=True)
-        if thread is None:
-            await interaction.response.send_message("`/ask` must be used inside a mapped Discord thread.", ephemeral=True)
-            return
-        if workspace is None:
-            await interaction.response.send_message("This thread's parent channel is not mapped to a workspace.", ephemeral=True)
-            return
-        if not await self.ensure_thread_binding(interaction, thread):
-            return
-
-        lock = self.get_thread_lock(thread.id)
-        if lock.locked():
-            await interaction.response.send_message("A Codex task is already running in this thread.", ephemeral=True)
-            return
-
-        await interaction.response.defer(thinking=True)
-        async with lock:
-            full_prompt = await self.build_thread_prompt(thread, prompt)
-            response_text = await self.run_codex(full_prompt, workspace)
-            await self.send_output(interaction, response_text, filename_prefix=f"ask-{thread.id}")
 
     async def handle_status(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
         if not await self.ensure_thread_only(interaction, command_name_for_role("status", self.config.bot_role)):
             return
-
-        thread, _ = self.resolve_thread_workspace(interaction, require_thread=False)
-        if thread is not None and not await self.ensure_thread_binding(interaction, thread):
+        if not await self.ensure_thread_owned(interaction):
             return
 
         await interaction.response.defer(thinking=True)
@@ -895,10 +890,10 @@ class CodexDiscordBot(commands.Bot):
             return
         if not await self.ensure_thread_only(interaction, command_name_for_role("diff", self.config.bot_role)):
             return
+        if not await self.ensure_thread_owned(interaction):
+            return
 
         thread, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
-        if thread is not None and not await self.ensure_thread_binding(interaction, thread):
-            return
         target_path = workspace or self.config.checkout_path
 
         await interaction.response.defer(thinking=True)
@@ -913,6 +908,8 @@ class CodexDiscordBot(commands.Bot):
             return
         if not await self.ensure_thread_only(interaction, "restart-staging"):
             return
+        if not await self.ensure_thread_owned(interaction):
+            return
 
         await interaction.response.defer(thinking=True)
         result_text = await self.run_main_operation("restart_staging", self.config.restart_staging_args)
@@ -925,6 +922,8 @@ class CodexDiscordBot(commands.Bot):
             await interaction.response.send_message("`/deploy` is only available on the main bot.", ephemeral=True)
             return
         if not await self.ensure_thread_only(interaction, "deploy"):
+            return
+        if not await self.ensure_thread_owned(interaction):
             return
 
         await interaction.response.defer(thinking=True)
@@ -946,27 +945,20 @@ async def ping_command(interaction: discord.Interaction) -> None:
 
 
 @app_commands.command(name="new-session", description="Create a new session thread bound to a selected bot. Channel only.")
-@app_commands.describe(target_bot_role="Which bot should own the new session", title="Thread title for the new session")
+@app_commands.describe(target_bot_role="Which bot should own the new session. Defaults to main", title="Thread title for the new session")
 @app_commands.choices(
     target_bot_role=[
-        app_commands.Choice(name="staging", value="staging"),
         app_commands.Choice(name="main", value="main"),
+        app_commands.Choice(name="staging", value="staging"),
     ]
 )
 async def new_session_command(
     interaction: discord.Interaction,
-    target_bot_role: app_commands.Choice[str],
     title: str,
+    target_bot_role: app_commands.Choice[str] | None = None,
 ) -> None:
     bot = get_bot_from_interaction(interaction)
-    await bot.handle_new_session(interaction, target_bot_role.value, title)
-
-
-@app_commands.command(name="ask", description="Run Codex for the current mapped thread. Thread only.")
-@app_commands.describe(prompt="Request to send to Codex")
-async def ask_command(interaction: discord.Interaction, prompt: str) -> None:
-    bot = get_bot_from_interaction(interaction)
-    await bot.handle_ask(interaction, prompt)
+    await bot.handle_new_session(interaction, target_bot_role.value if target_bot_role else "main", title)
 
 
 @app_commands.command(name="status", description="Show bot role, checkout, and recent status. Thread only.")

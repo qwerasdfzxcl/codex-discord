@@ -5,9 +5,9 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/srv/codex-discord/prod
-EnvironmentFile=/srv/codex-discord/prod/.env
-ExecStart=/srv/codex-discord/prod/.venv/bin/python /srv/codex-discord/prod/app.py
+WorkingDirectory=/srv/codex-discord/main
+EnvironmentFile=/srv/codex-discord/main/.env
+ExecStart=/srv/codex-discord/main/.venv/bin/python /srv/codex-discord/main/app.py
 Restart=on-failure
 RestartSec=5
 

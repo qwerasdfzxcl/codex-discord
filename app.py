@@ -6,7 +6,7 @@ import os
 import re
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,10 +21,16 @@ DISCORD_THREAD_NAME_LIMIT = 100
 DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_HISTORY_MESSAGES = 20
 DEFAULT_MAX_PROMPT_CHARS = 12000
+EMBED_DESCRIPTION_LIMIT = 4000
+EMBED_FIELD_VALUE_LIMIT = 1024
 THREAD_BINDING_PATTERN = re.compile(r"^\[bot:(main|staging)\]\s*")
 STATE_DIRECTORY_NAME = ".codex-discord-state"
 BACKGROUND_OPERATIONS_DIR_NAME = "background-operations"
 BACKGROUND_OPERATION_POLL_SECONDS = 5
+EMBED_COLOR_INFO = 0x5865F2
+EMBED_COLOR_SUCCESS = 0x57F287
+EMBED_COLOR_WARNING = 0xFEE75C
+EMBED_COLOR_ERROR = 0xED4245
 
 
 class ConfigError(Exception):
@@ -96,6 +102,29 @@ class BackgroundOperation:
     log_path: Path
 
 
+@dataclass
+class GitSummary:
+    path: Path
+    is_repo: bool
+    branch: str = "(알 수 없음)"
+    commit: str = "(알 수 없음)"
+    changed_files: int = 0
+    status_lines: list[str] = field(default_factory=list)
+    stderr: str = ""
+
+
+@dataclass
+class DiffSummary:
+    path: Path
+    git: GitSummary
+    diff_stat: str
+    status_stderr: str = ""
+    diff_stderr: str = ""
+    staged_count: int = 0
+    unstaged_count: int = 0
+    untracked_count: int = 0
+
+
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -103,7 +132,7 @@ def now_utc_iso() -> str:
 def chunk_text(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
     stripped = text.strip()
     if not stripped:
-        return ["(no output)"]
+        return ["(출력 없음)"]
 
     chunks: list[str] = []
     remaining = stripped
@@ -150,6 +179,38 @@ def command_name_for_role(base_name: str, bot_role: str) -> str:
     if bot_role == "staging":
         return f"{base_name}-staging"
     return base_name
+
+
+def format_code_block(text: str) -> str:
+    normalized = text.strip() or "(출력 없음)"
+    safe = normalized.replace("```", "'''")
+    return f"```text\n{safe}\n```"
+
+
+def output_title_for_prefix(filename_prefix: str) -> str:
+    if filename_prefix == "status":
+        return "현재 상태"
+    if filename_prefix == "diff":
+        return "변경 사항"
+    if filename_prefix == "restart-staging":
+        return "스테이징 재시작 결과"
+    if filename_prefix == "restart":
+        return "재시작 결과"
+    if filename_prefix == "deploy":
+        return "배포 결과"
+    return "실행 결과"
+
+
+def truncate_text(text: str, limit: int) -> str:
+    normalized = text.strip() or "없음"
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 4].rstrip() + "\n..."
+
+
+def format_code_field(text: str, limit: int = EMBED_FIELD_VALUE_LIMIT) -> str:
+    wrapped_limit = max(32, limit - 12)
+    return format_code_block(truncate_text(text, wrapped_limit))
 
 
 def parse_command_args(name: str, value: object, default: list[str] | None = None) -> list[str]:
@@ -433,11 +494,17 @@ class AppServerApprovalView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.bot.config.allowed_user_id:
-            await interaction.response.send_message("You are not allowed to approve this action.", ephemeral=True)
+            await self.bot.send_interaction_embed(
+                interaction,
+                title="승인 권한 없음",
+                description="이 승인 요청을 처리할 권한이 없어요.",
+                tone="error",
+                ephemeral=True,
+            )
             return False
         return True
 
-    @discord.ui.button(label="Approve", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="승인", style=discord.ButtonStyle.danger)
     async def approve(  # type: ignore[override]
         self,
         interaction: discord.Interaction,
@@ -445,7 +512,7 @@ class AppServerApprovalView(discord.ui.View):
     ) -> None:
         await self.bot.handle_app_server_approval_click(interaction, self.approval_id, approved=True, view=self)
 
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="거절", style=discord.ButtonStyle.secondary)
     async def deny(  # type: ignore[override]
         self,
         interaction: discord.Interaction,
@@ -640,14 +707,14 @@ class ThreadSessionRuntime:
                         await self.bot.post_agent_message(
                             self.discord_thread_id,
                             turn_state.source_message_id,
-                            f"Turn failed: {message}",
+                            f"작업이 실패했어요: {message}",
                             reply_to_source=True,
                         )
                 elif status == "interrupted":
                     await self.bot.post_agent_message(
                         self.discord_thread_id,
                         turn_state.source_message_id,
-                        "Turn interrupted.",
+                        "작업이 중단됐어요.",
                         reply_to_source=True,
                     )
 
@@ -771,6 +838,114 @@ class CodexDiscordBot(commands.Bot):
         state_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"{self.config.bot_role}-app-server-threads.json"
         self.session_store = SessionStore(state_path)
 
+    def build_embed(self, title: str, description: str | None = None, tone: str = "info") -> discord.Embed:
+        color = EMBED_COLOR_INFO
+        if tone == "success":
+            color = EMBED_COLOR_SUCCESS
+        elif tone == "warning":
+            color = EMBED_COLOR_WARNING
+        elif tone == "error":
+            color = EMBED_COLOR_ERROR
+
+        embed = discord.Embed(title=title, description=description, color=color)
+        embed.set_footer(text=f"codex-discord · {self.config.bot_role}")
+        return embed
+
+    def add_embed_field(self, embed: discord.Embed, name: str, value: str, *, inline: bool = False, code: bool = False) -> None:
+        if code:
+            embed.add_field(name=name, value=format_code_field(value), inline=inline)
+            return
+        embed.add_field(name=name, value=truncate_text(value, EMBED_FIELD_VALUE_LIMIT), inline=inline)
+
+    async def send_interaction_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        embed: discord.Embed,
+        ephemeral: bool = False,
+        view: discord.ui.View | None = None,
+        file: discord.File | None = None,
+    ) -> None:
+        kwargs: dict[str, object] = {"embed": embed}
+        if ephemeral:
+            kwargs["ephemeral"] = True
+        if view is not None:
+            kwargs["view"] = view
+        if file is not None:
+            kwargs["file"] = file
+        if interaction.response.is_done():
+            await interaction.followup.send(**kwargs)
+        else:
+            await interaction.response.send_message(**kwargs)
+
+    async def send_channel_message(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        embed: discord.Embed,
+        view: discord.ui.View | None = None,
+        file: discord.File | None = None,
+    ) -> None:
+        kwargs: dict[str, object] = {"embed": embed}
+        if view is not None:
+            kwargs["view"] = view
+        if file is not None:
+            kwargs["file"] = file
+        await channel.send(**kwargs)
+
+    async def send_interaction_embed(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        description: str | None = None,
+        *,
+        tone: str = "info",
+        ephemeral: bool = False,
+        view: discord.ui.View | None = None,
+        file: discord.File | None = None,
+    ) -> None:
+        embed = self.build_embed(title, description, tone=tone)
+        await self.send_interaction_message(
+            interaction,
+            embed=embed,
+            ephemeral=ephemeral,
+            view=view,
+            file=file,
+        )
+
+    async def send_channel_embed(
+        self,
+        channel: discord.abc.Messageable,
+        title: str,
+        description: str | None = None,
+        *,
+        tone: str = "info",
+        view: discord.ui.View | None = None,
+        file: discord.File | None = None,
+    ) -> None:
+        embed = self.build_embed(title, description, tone=tone)
+        await self.send_channel_message(channel, embed=embed, view=view, file=file)
+
+    async def reply_with_output_file(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        filename_prefix: str,
+        text: str,
+        *,
+        tone: str = "info",
+    ) -> None:
+        filename = f"{filename_prefix}.txt"
+        file_data = io.BytesIO(text.encode("utf-8", errors="replace"))
+        file = discord.File(file_data, filename=filename)
+        await self.send_interaction_embed(
+            interaction,
+            title=title,
+            description=f"내용이 길어서 `{filename}` 파일로 첨부했어요.",
+            tone=tone,
+            file=file,
+        )
+
     async def setup_hook(self) -> None:
         guild = discord.Object(id=self.config.guild_id) if self.config.guild_id else None
         self.tree.on_error = self.on_tree_error
@@ -829,15 +1004,25 @@ class CodexDiscordBot(commands.Bot):
         if not prompt:
             return
         if len(prompt) > self.config.max_prompt_chars:
-            await thread.send(
-                f"Prompt is too long ({len(prompt)} chars). "
-                f"Limit: {self.config.max_prompt_chars} chars."
+            await self.send_channel_embed(
+                thread,
+                title="입력이 너무 깁니다",
+                description=(
+                    f"현재 입력 길이: `{len(prompt)}`자\n"
+                    f"허용 최대 길이: `{self.config.max_prompt_chars}`자"
+                ),
+                tone="warning",
             )
             return
 
         lock = self.get_thread_lock(thread.id)
         if lock.locked():
-            await thread.send("A Codex task is already running in this thread. Wait for it to finish.")
+            await self.send_channel_embed(
+                thread,
+                title="작업 진행 중",
+                description="이 스레드에서는 이미 Codex 작업이 실행 중이에요. 현재 작업이 끝난 뒤 다시 시도해 주세요.",
+                tone="warning",
+            )
             return
 
         async with lock:
@@ -848,22 +1033,30 @@ class CodexDiscordBot(commands.Bot):
                     turn = await runtime.run_turn(prompt, message)
                 except Exception as exc:
                     duration = asyncio.get_running_loop().time() - started
-                    self.record_execution("ask", "failed", workspace, duration, f"runtime error: {exc}")
-                    await thread.send(f"Codex runtime error: {exc}")
+                    self.record_execution("ask", "failed", workspace, duration, f"런타임 오류: {exc}")
+                    await self.send_channel_embed(
+                        thread,
+                        title="Codex 실행 오류",
+                        description=f"작업을 처리하던 중 오류가 발생했어요.\n`{exc}`",
+                        tone="error",
+                    )
                     return
                 duration = asyncio.get_running_loop().time() - started
                 turn_status = str(turn.get("status", "unknown"))
-                summary = f"turn {turn_status} in {duration:.1f}s"
+                turn_status_label = "완료" if turn_status == "completed" else turn_status
+                summary = f"응답 상태: {turn_status_label} ({duration:.1f}s)"
                 record_status = "success" if turn_status == "completed" else "failed"
                 self.record_execution("ask", record_status, workspace, duration, summary)
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         logging.exception("Unhandled app command error", exc_info=error)
-        message = f"Command failed: {error}"
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        await self.send_interaction_embed(
+            interaction,
+            title="명령 실행 실패",
+            description=f"슬래시 커맨드를 처리하지 못했어요.\n`{error}`",
+            tone="error",
+            ephemeral=True,
+        )
 
     def is_allowed_user(self, user_id: int) -> bool:
         return user_id == self.config.allowed_user_id
@@ -877,6 +1070,24 @@ class CodexDiscordBot(commands.Bot):
             duration_seconds=duration_seconds,
             summary=summary,
         )
+
+    def format_execution_status(self, status: str) -> str:
+        if status == "success":
+            return "성공"
+        if status == "failed":
+            return "실패"
+        if status == "requested":
+            return "요청됨"
+        return status
+
+    def format_background_status(self, status: str) -> str:
+        if status == "succeeded":
+            return "성공"
+        if status == "failed":
+            return "실패"
+        if status == "pending":
+            return "대기 중"
+        return status
 
     def background_operations_dir(self) -> Path:
         return self.config.checkout_path / STATE_DIRECTORY_NAME / BACKGROUND_OPERATIONS_DIR_NAME
@@ -934,15 +1145,16 @@ class CodexDiscordBot(commands.Bot):
         if owner_role == self.config.bot_role:
             return True
 
-        expected_command_prefix = "" if owner_role == "main" else "-staging"
-        message = (
-            f"This thread belongs to the `{owner_role}` bot. "
-            f"Use the `{owner_role}` bot commands{expected_command_prefix} in this thread."
+        await self.send_interaction_embed(
+            interaction,
+            title="다른 봇 전용 스레드",
+            description=(
+                f"이 스레드는 `{owner_role}` 봇이 담당하는 세션이에요.\n"
+                f"이 스레드에서는 `{owner_role}` 봇용 명령을 사용해 주세요."
+            ),
+            tone="warning",
+            ephemeral=True,
         )
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
         return False
 
     def resolve_session_parent_channel(self, interaction: discord.Interaction) -> tuple[discord.TextChannel | None, Path | None]:
@@ -964,71 +1176,71 @@ class CodexDiscordBot(commands.Bot):
         if self.is_allowed_user(interaction.user.id):
             return True
 
-        message = "You are not allowed to use this bot."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        await self.send_interaction_embed(
+            interaction,
+            title="사용 권한 없음",
+            description="이 봇은 현재 허용된 사용자만 사용할 수 있어요.",
+            tone="error",
+            ephemeral=True,
+        )
         return False
 
     async def ensure_channel_only(self, interaction: discord.Interaction, command_name: str) -> bool:
         if isinstance(interaction.channel, discord.Thread):
-            message = f"`/{command_name}` can only be used in a parent channel, not inside a thread."
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
+            await self.send_interaction_embed(
+                interaction,
+                title="채널에서만 사용 가능",
+                description=f"`/{command_name}` 명령은 부모 채널에서만 사용할 수 있어요. 스레드 안에서는 실행할 수 없습니다.",
+                tone="warning",
+                ephemeral=True,
+            )
             return False
         return True
 
     async def ensure_thread_only(self, interaction: discord.Interaction, command_name: str) -> bool:
         if not isinstance(interaction.channel, discord.Thread):
-            message = f"`/{command_name}` can only be used inside a thread."
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
+            await self.send_interaction_embed(
+                interaction,
+                title="스레드에서만 사용 가능",
+                description=f"`/{command_name}` 명령은 세션 스레드 안에서만 사용할 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
             return False
         return True
 
     async def ensure_session_context(self, interaction: discord.Interaction, command_name: str) -> bool:
         parent_channel, workspace = self.resolve_session_parent_channel(interaction)
         if parent_channel is None or workspace is None:
-            message = f"`/{command_name}` must be used in a mapped parent channel or one of its threads."
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
+            await self.send_interaction_embed(
+                interaction,
+                title="워크스페이스 연결 필요",
+                description=f"`/{command_name}` 명령은 워크스페이스가 연결된 채널 또는 해당 스레드에서만 사용할 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
             return False
         return True
 
     async def send_output(self, interaction: discord.Interaction, text: str, filename_prefix: str) -> None:
-        if len(text) > DISCORD_FILE_FALLBACK_LIMIT:
-            filename = f"{filename_prefix}.txt"
-            file_data = io.BytesIO(text.encode("utf-8", errors="replace"))
-            file = discord.File(file_data, filename=filename)
-            summary = f"Output was too long, attached as `{filename}`."
-            if interaction.response.is_done():
-                await interaction.followup.send(summary, file=file)
-            else:
-                await interaction.response.send_message(summary, file=file)
+        title = output_title_for_prefix(filename_prefix)
+        output_block = format_code_block(text)
+        if len(output_block) > EMBED_DESCRIPTION_LIMIT or len(text) > DISCORD_FILE_FALLBACK_LIMIT:
+            await self.reply_with_output_file(interaction, title, filename_prefix, text)
             return
 
-        chunks = chunk_text(text)
-        if interaction.response.is_done():
-            await interaction.followup.send(chunks[0])
-        else:
-            await interaction.response.send_message(chunks[0])
-
-        for chunk in chunks[1:]:
-            await interaction.followup.send(chunk)
+        await self.send_interaction_embed(interaction, title=title, description=output_block)
 
     async def send_message_output(self, source_message: discord.Message, text: str, filename_prefix: str) -> None:
         if len(text) > DISCORD_FILE_FALLBACK_LIMIT:
             filename = f"{filename_prefix}.txt"
             file_data = io.BytesIO(text.encode("utf-8", errors="replace"))
             file = discord.File(file_data, filename=filename)
-            await source_message.reply(f"Output was too long, attached as `{filename}`.", file=file, mention_author=False)
+            await source_message.reply(
+                f"응답이 길어서 `{filename}` 파일로 첨부했어요.",
+                file=file,
+                mention_author=False,
+            )
             return
 
         chunks = chunk_text(text)
@@ -1107,7 +1319,12 @@ class CodexDiscordBot(commands.Bot):
             filename = f"message-{thread_id}.txt"
             file_data = io.BytesIO(text.encode("utf-8", errors="replace"))
             file = discord.File(file_data, filename=filename)
-            await channel.send(f"Output was too long, attached as `{filename}`.", file=file)
+            await self.send_channel_embed(
+                channel,
+                title="응답 첨부",
+                description=f"응답이 길어서 `{filename}` 파일로 첨부했어요.",
+                file=file,
+            )
             return
 
         chunks = chunk_text(text)
@@ -1115,39 +1332,44 @@ class CodexDiscordBot(commands.Bot):
         for chunk in chunks[1:]:
             await channel.send(chunk)
 
-    def format_app_server_approval_message(self, method: str, params: dict[str, object]) -> str:
+    def format_app_server_approval_message(self, method: str, params: dict[str, object]) -> tuple[str, str]:
         reason = params.get("reason")
-        reason_line = f"reason: {reason}" if isinstance(reason, str) and reason.strip() else "reason: (none)"
+        reason_line = f"사유: {reason}" if isinstance(reason, str) and reason.strip() else "사유: 없음"
 
         if method == "item/commandExecution/requestApproval":
             command = params.get("command")
             cwd = params.get("cwd")
-            lines = ["Codex wants to run a command.", reason_line]
+            lines = ["Codex가 명령 실행 승인을 요청했어요.", reason_line]
             if isinstance(command, str) and command.strip():
-                lines.append(f"command: `{command}`")
+                lines.append(f"명령어: `{command}`")
             if isinstance(cwd, str) and cwd.strip():
-                lines.append(f"cwd: `{cwd}`")
-            return "\n".join(lines)
+                lines.append(f"작업 경로: `{cwd}`")
+            return "승인 요청", "\n".join(lines)
 
         if method == "item/fileChange/requestApproval":
             grant_root = params.get("grantRoot")
-            lines = ["Codex wants to apply file changes.", reason_line]
+            lines = ["Codex가 파일 변경 승인을 요청했어요.", reason_line]
             if isinstance(grant_root, str) and grant_root.strip():
-                lines.append(f"grant root: `{grant_root}`")
-            return "\n".join(lines)
+                lines.append(f"허용 루트: `{grant_root}`")
+            return "승인 요청", "\n".join(lines)
 
         if method == "item/permissions/requestApproval":
             permissions = params.get("permissions")
-            return "Codex requested additional permissions.\n" + reason_line + f"\npermissions: `{json.dumps(permissions, ensure_ascii=False)}`"
+            return (
+                "권한 요청",
+                "Codex가 추가 권한을 요청했어요.\n"
+                + reason_line
+                + f"\n권한: `{json.dumps(permissions, ensure_ascii=False)}`",
+            )
 
         if method == "execCommandApproval":
             command = params.get("command")
-            return "Codex wants to run a command.\n" + reason_line + f"\ncommand: `{command}`"
+            return "승인 요청", "Codex가 명령 실행 승인을 요청했어요.\n" + reason_line + f"\n명령어: `{command}`"
 
         if method == "applyPatchApproval":
-            return "Codex wants to apply a patch.\n" + reason_line
+            return "승인 요청", "Codex가 패치 적용 승인을 요청했어요.\n" + reason_line
 
-        return f"Codex requested approval for `{method}`.\n{reason_line}"
+        return "승인 요청", f"Codex가 `{method}` 작업에 대한 승인을 요청했어요.\n{reason_line}"
 
     async def handle_app_server_request(
         self,
@@ -1174,7 +1396,8 @@ class CodexDiscordBot(commands.Bot):
             return
 
         view = AppServerApprovalView(self, approval_id)
-        await channel.send(self.format_app_server_approval_message(method, params), view=view)
+        title, description = self.format_app_server_approval_message(method, params)
+        await self.send_channel_embed(channel, title=title, description=description, tone="warning", view=view)
 
     async def handle_app_server_approval_click(
         self,
@@ -1186,7 +1409,8 @@ class CodexDiscordBot(commands.Bot):
         pending = self.pending_approvals.pop(approval_id, None)
         if pending is None:
             self.disable_view_buttons(view)
-            await interaction.response.edit_message(content="This approval request is no longer available.", view=view)
+            embed = self.build_embed("승인 요청 만료", "이 승인 요청은 더 이상 유효하지 않아요.", tone="warning")
+            await interaction.response.edit_message(embed=embed, view=view, content=None)
             return
 
         self.disable_view_buttons(view)
@@ -1209,11 +1433,20 @@ class CodexDiscordBot(commands.Bot):
             await pending.runtime.send_response(pending.request_id, response_payload)
         except Exception as exc:
             logging.exception("Failed to send approval response")
-            await interaction.response.edit_message(content=f"Failed to send approval response: {exc}", view=view)
+            embed = self.build_embed(
+                "승인 응답 실패",
+                f"승인 결과를 Codex에 전달하지 못했어요.\n`{exc}`",
+                tone="error",
+            )
+            await interaction.response.edit_message(embed=embed, view=view, content=None)
             return
 
-        status_text = "Approved." if approved else "Denied."
-        await interaction.response.edit_message(content=status_text, view=view)
+        embed = self.build_embed(
+            "승인 처리 완료" if approved else "승인 거절됨",
+            "요청을 승인했어요." if approved else "요청을 거절했어요.",
+            tone="success" if approved else "warning",
+        )
+        await interaction.response.edit_message(embed=embed, view=view, content=None)
 
     async def run_process(self, args: list[str], cwd: Path, timeout_seconds: int | None = None) -> "ProcessResult":
         timeout = timeout_seconds or self.config.timeout_seconds
@@ -1258,14 +1491,14 @@ class CodexDiscordBot(commands.Bot):
             return None
         return record
 
-    async def get_git_summary(self, target_path: Path) -> str:
+    async def collect_git_summary(self, target_path: Path) -> GitSummary:
         inside_repo = await self.run_process(
             ["git", "rev-parse", "--is-inside-work-tree"],
             cwd=target_path,
             timeout_seconds=15,
         )
         if inside_repo.timed_out or inside_repo.returncode != 0 or inside_repo.stdout != "true":
-            return f"path: {target_path}\ngit: not a repository"
+            return GitSummary(path=target_path, is_repo=False)
 
         branch_result = await self.run_process(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -1283,21 +1516,48 @@ class CodexDiscordBot(commands.Bot):
             timeout_seconds=15,
         )
 
-        branch = branch_result.stdout or "(unknown)"
-        commit = commit_result.stdout or "(unknown)"
-        changed_files = 0
-        if status_result.stdout:
-            changed_files = len(status_result.stdout.splitlines())
+        status_lines = status_result.stdout.splitlines() if status_result.stdout else []
+        return GitSummary(
+            path=target_path,
+            is_repo=True,
+            branch=branch_result.stdout or "(알 수 없음)",
+            commit=commit_result.stdout or "(알 수 없음)",
+            changed_files=len(status_lines),
+            status_lines=status_lines,
+            stderr=status_result.stderr,
+        )
+
+    def render_git_summary_text(self, summary: GitSummary) -> str:
+        if not summary.is_repo:
+            return f"경로: {summary.path}\nGit: 저장소가 아닙니다"
 
         lines = [
-            f"path: {target_path}",
-            f"branch: {branch}",
-            f"commit: {commit}",
-            f"changed files: {changed_files}",
+            f"경로: {summary.path}",
+            f"브랜치: {summary.branch}",
+            f"최근 커밋: {summary.commit}",
+            f"변경 파일 수: {summary.changed_files}",
         ]
-        if status_result.stderr:
-            lines.append(f"git stderr:\n{status_result.stderr}")
+        if summary.stderr:
+            lines.append(f"Git stderr:\n{summary.stderr}")
         return "\n".join(lines)
+
+    def summarize_git_changes(self, status_lines: list[str]) -> tuple[int, int, int]:
+        staged_count = 0
+        unstaged_count = 0
+        untracked_count = 0
+        for line in status_lines:
+            if not line:
+                continue
+            if line.startswith("??"):
+                untracked_count += 1
+                continue
+            staged_code = line[0]
+            unstaged_code = line[1] if len(line) > 1 else " "
+            if staged_code not in {" ", "?"}:
+                staged_count += 1
+            if unstaged_code not in {" ", "?"}:
+                unstaged_count += 1
+        return staged_count, unstaged_count, untracked_count
 
     async def build_status_text(self, interaction: discord.Interaction) -> str:
         thread, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
@@ -1309,57 +1569,153 @@ class CodexDiscordBot(commands.Bot):
                 thread_session = self.get_thread_session(thread.id, workspace)
 
         lines = [
-            f"role: {self.config.bot_role}",
-            f"checkout: {self.config.checkout_path}",
-            f"active threads: {self.active_thread_count()}",
-            f"current thread busy: {'yes' if current_thread_busy else 'no'}",
+            f"봇 역할: {self.config.bot_role}",
+            f"체크아웃 경로: {self.config.checkout_path}",
+            f"현재 작업 중인 스레드 수: {self.active_thread_count()}",
+            f"이 스레드 실행 중 여부: {'예' if current_thread_busy else '아니요'}",
+            f"모델: {self.resolve_codex_model() or '기본값'}",
+            f"승인 정책: {self.resolve_approval_policy()}",
+            f"샌드박스: {self.resolve_sandbox_mode()}",
         ]
 
         if workspace is not None:
-            lines.append(f"thread workspace: {workspace}")
+            lines.append(f"스레드 워크스페이스: {workspace}")
         else:
-            lines.append("thread workspace: (not in a mapped thread)")
+            lines.append("스레드 워크스페이스: 연결된 스레드가 아닙니다")
 
         if thread_session is not None:
-            lines.append(f"thread session id: {thread_session.session_id}")
-            lines.append(f"thread session updated: {thread_session.updated_at}")
+            lines.append(f"세션 ID: {thread_session.session_id}")
+            lines.append(f"세션 갱신 시각: {thread_session.updated_at}")
         else:
-            lines.append("thread session id: (none)")
+            lines.append("세션 ID: 없음")
 
         if self.last_execution is None:
-            lines.append("last execution: none")
+            lines.append("최근 실행 기록: 없음")
         else:
             lines.extend(
                 [
-                    f"last execution command: {self.last_execution.command_name}",
-                    f"last execution status: {self.last_execution.status}",
-                    f"last execution target: {self.last_execution.target_path or '(none)'}",
-                    f"last execution time: {self.last_execution.started_at}",
-                    f"last execution duration: {self.last_execution.duration_seconds:.1f}s",
-                    f"last execution summary: {self.last_execution.summary}",
+                    f"최근 실행 명령: {self.last_execution.command_name}",
+                    f"최근 실행 상태: {self.format_execution_status(self.last_execution.status)}",
+                    f"최근 실행 대상: {self.last_execution.target_path or '없음'}",
+                    f"최근 실행 시각: {self.last_execution.started_at}",
+                    f"최근 실행 시간: {self.last_execution.duration_seconds:.1f}s",
+                    f"최근 실행 요약: {self.last_execution.summary}",
                 ]
             )
 
+        checkout_git = await self.collect_git_summary(self.config.checkout_path)
         lines.append("")
-        lines.append("checkout git:")
-        lines.append(await self.get_git_summary(self.config.checkout_path))
+        lines.append("[체크아웃 Git 상태]")
+        lines.append(self.render_git_summary_text(checkout_git))
 
         if workspace is not None and workspace != self.config.checkout_path:
+            workspace_git = await self.collect_git_summary(workspace)
             lines.append("")
-            lines.append("workspace git:")
-            lines.append(await self.get_git_summary(workspace))
+            lines.append("[워크스페이스 Git 상태]")
+            lines.append(self.render_git_summary_text(workspace_git))
 
         return "\n".join(lines)
 
-    async def build_diff_text(self, target_path: Path) -> str:
-        inside_repo = await self.run_process(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=target_path,
-            timeout_seconds=15,
+    async def send_status_embed(self, interaction: discord.Interaction) -> None:
+        thread, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
+        current_thread_busy = False
+        thread_session: ThreadSessionRecord | None = None
+        if thread is not None:
+            current_thread_busy = self.get_thread_lock(thread.id).locked()
+            if workspace is not None:
+                thread_session = self.get_thread_session(thread.id, workspace)
+
+        checkout_git = await self.collect_git_summary(self.config.checkout_path)
+        workspace_git = None
+        if workspace is not None and workspace != self.config.checkout_path:
+            workspace_git = await self.collect_git_summary(workspace)
+
+        tone = "info"
+        if self.last_execution is not None and self.last_execution.status == "failed":
+            tone = "warning"
+        embed = self.build_embed(
+            "현재 상태",
+            None,
+            tone=tone,
         )
-        if inside_repo.timed_out or inside_repo.returncode != 0 or inside_repo.stdout != "true":
-            self.record_execution("diff", "failed", target_path, inside_repo.duration_seconds, "not a git repository")
-            return f"path: {target_path}\ngit: not a repository"
+
+        self.add_embed_field(
+            embed,
+            "세션",
+            (
+                f"역할: {self.config.bot_role}\n"
+                f"스레드 작업 중: {'예' if current_thread_busy else '아니요'}\n"
+                f"활성 스레드 수: {self.active_thread_count()}\n"
+                f"워크스페이스: {workspace or '연결 없음'}\n"
+                f"세션 ID: {thread_session.session_id if thread_session else '없음'}"
+            ),
+            inline=False,
+        )
+        self.add_embed_field(
+            embed,
+            "실행 환경",
+            (
+                f"체크아웃: {self.config.checkout_path}\n"
+                f"모델: {self.resolve_codex_model() or '기본값'}\n"
+                f"승인 정책: {self.resolve_approval_policy()}\n"
+                f"샌드박스: {self.resolve_sandbox_mode()}"
+            ),
+            inline=False,
+        )
+
+        if self.last_execution is not None:
+            self.add_embed_field(
+                embed,
+                "최근 실행",
+                (
+                    f"명령: {self.last_execution.command_name}\n"
+                    f"상태: {self.format_execution_status(self.last_execution.status)}\n"
+                    f"대상: {self.last_execution.target_path or '없음'}\n"
+                    f"시각: {self.last_execution.started_at}\n"
+                    f"소요 시간: {self.last_execution.duration_seconds:.1f}s\n"
+                    f"요약: {self.last_execution.summary}"
+                ),
+                inline=False,
+            )
+
+        self.add_embed_field(
+            embed,
+            "체크아웃 Git",
+            (
+                f"브랜치: {checkout_git.branch}\n"
+                f"최근 커밋: {checkout_git.commit}\n"
+                f"변경 파일 수: {checkout_git.changed_files}\n"
+                f"경로: {checkout_git.path}"
+            )
+            if checkout_git.is_repo
+            else f"경로: {checkout_git.path}\nGit 저장소가 아닙니다.",
+            inline=False,
+        )
+        if workspace_git is not None:
+            self.add_embed_field(
+                embed,
+                "워크스페이스 Git",
+                (
+                    f"브랜치: {workspace_git.branch}\n"
+                    f"최근 커밋: {workspace_git.commit}\n"
+                    f"변경 파일 수: {workspace_git.changed_files}\n"
+                    f"경로: {workspace_git.path}"
+                )
+                if workspace_git.is_repo
+                else f"경로: {workspace_git.path}\nGit 저장소가 아닙니다.",
+                inline=False,
+            )
+
+        raw_text = await self.build_status_text(interaction)
+        if len(embed) > 5900:
+            await self.reply_with_output_file(interaction, "현재 상태", "status", raw_text)
+            return
+        await self.send_interaction_message(interaction, embed=embed)
+    async def collect_diff_summary(self, target_path: Path) -> DiffSummary:
+        git_summary = await self.collect_git_summary(target_path)
+        if not git_summary.is_repo:
+            self.record_execution("diff", "failed", target_path, 0.0, "Git 저장소가 아님")
+            return DiffSummary(path=target_path, git=git_summary, diff_stat="")
 
         status_result = await self.run_process(
             ["git", "status", "--short"],
@@ -1372,9 +1728,9 @@ class CodexDiscordBot(commands.Bot):
             timeout_seconds=15,
         )
 
-        summary = "clean working tree"
+        summary = "작업 트리가 깨끗함"
         if status_result.stdout or diff_stat_result.stdout:
-            summary = "changes detected"
+            summary = "변경 사항 감지됨"
 
         status = "success" if not status_result.timed_out and not diff_stat_result.timed_out else "failed"
         self.record_execution(
@@ -1384,34 +1740,130 @@ class CodexDiscordBot(commands.Bot):
             max(status_result.duration_seconds, diff_stat_result.duration_seconds),
             summary,
         )
+        status_lines = status_result.stdout.splitlines() if status_result.stdout else []
+        staged_count, unstaged_count, untracked_count = self.summarize_git_changes(status_lines)
+        return DiffSummary(
+            path=target_path,
+            git=GitSummary(
+                path=git_summary.path,
+                is_repo=True,
+                branch=git_summary.branch,
+                commit=git_summary.commit,
+                changed_files=len(status_lines),
+                status_lines=status_lines,
+                stderr=git_summary.stderr,
+            ),
+            diff_stat=diff_stat_result.stdout,
+            status_stderr=status_result.stderr,
+            diff_stderr=diff_stat_result.stderr,
+            staged_count=staged_count,
+            unstaged_count=unstaged_count,
+            untracked_count=untracked_count,
+        )
 
-        lines = [f"path: {target_path}", "", "changed files:"]
-        lines.append(status_result.stdout or "(no changed files)")
-        lines.append("")
-        lines.append("diff stat:")
-        lines.append(diff_stat_result.stdout or "(no diff stat)")
+    def render_diff_text(self, summary: DiffSummary) -> str:
+        if not summary.git.is_repo:
+            return f"경로: {summary.path}\nGit: 저장소가 아닙니다"
 
-        if status_result.stderr:
-            lines.append("")
-            lines.append(f"status stderr:\n{status_result.stderr}")
-        if diff_stat_result.stderr:
-            lines.append("")
-            lines.append(f"diff stderr:\n{diff_stat_result.stderr}")
-
+        lines = [
+            f"경로: {summary.path}",
+            f"브랜치: {summary.git.branch}",
+            f"최근 커밋: {summary.git.commit}",
+            "",
+            "[요약]",
+            f"변경 파일 수: {summary.git.changed_files}",
+            f"스테이지됨: {summary.staged_count}",
+            f"작업 디렉토리 변경: {summary.unstaged_count}",
+            f"추적 안 된 파일: {summary.untracked_count}",
+            "",
+            "[변경 파일]",
+            "\n".join(summary.git.status_lines) or "(변경 파일 없음)",
+            "",
+            "[Diff 통계]",
+            summary.diff_stat or "(Diff 통계 없음)",
+        ]
+        if summary.status_stderr:
+            lines.extend(["", f"상태 확인 오류 출력:\n{summary.status_stderr}"])
+        if summary.diff_stderr:
+            lines.extend(["", f"Diff 오류 출력:\n{summary.diff_stderr}"])
         return "\n".join(lines)
+
+    async def send_diff_embed(self, interaction: discord.Interaction, target_path: Path) -> None:
+        summary = await self.collect_diff_summary(target_path)
+        raw_text = self.render_diff_text(summary)
+        if not summary.git.is_repo:
+            await self.send_interaction_embed(
+                interaction,
+                title="변경 사항",
+                description=f"`{target_path}` 경로는 Git 저장소가 아니에요.",
+                tone="error",
+            )
+            return
+
+        if summary.git.changed_files == 0 and not summary.diff_stat:
+            tone = "success"
+        else:
+            tone = "warning"
+
+        embed = self.build_embed("변경 사항", None, tone=tone)
+        self.add_embed_field(
+            embed,
+            "작업 위치",
+            (
+                f"경로: {summary.path}\n"
+                f"브랜치: {summary.git.branch}\n"
+                f"최근 커밋: {summary.git.commit}"
+            ),
+            inline=False,
+        )
+        self.add_embed_field(
+            embed,
+            "요약",
+            (
+                f"변경 파일 수: {summary.git.changed_files}\n"
+                f"스테이지됨: {summary.staged_count}\n"
+                f"작업 디렉토리 변경: {summary.unstaged_count}\n"
+                f"추적 안 된 파일: {summary.untracked_count}"
+            ),
+            inline=False,
+        )
+        self.add_embed_field(
+            embed,
+            "변경 파일",
+            "\n".join(summary.git.status_lines) or "(변경 파일 없음)",
+            inline=False,
+            code=True,
+        )
+        self.add_embed_field(
+            embed,
+            "Diff 통계",
+            summary.diff_stat or "(Diff 통계 없음)",
+            inline=False,
+            code=True,
+        )
+
+        if summary.status_stderr:
+            self.add_embed_field(embed, "상태 확인 오류", summary.status_stderr, inline=False, code=True)
+        if summary.diff_stderr:
+            self.add_embed_field(embed, "Diff 오류", summary.diff_stderr, inline=False, code=True)
+
+        if len(embed) > 5900 or len(raw_text) > DISCORD_FILE_FALLBACK_LIMIT:
+            await self.reply_with_output_file(interaction, "변경 사항", "diff", raw_text, tone=tone)
+            return
+        await self.send_interaction_message(interaction, embed=embed)
 
     async def run_main_operation(self, command_name: str, args: list[str]) -> str:
         try:
             result = await self.run_process(args=args, cwd=self.config.checkout_path)
         except FileNotFoundError:
-            summary = f"missing executable: {args[0]}"
+            summary = f"실행 파일 없음: {args[0]}"
             self.record_execution(command_name, "failed", self.config.checkout_path, 0.0, summary)
-            return f"Unable to start `{args[0]}`."
+            return f"`{args[0]}` 실행 파일을 찾지 못했어요."
         except Exception as exc:
             logging.exception("Unexpected error while running %s", command_name)
-            summary = f"unexpected error: {exc}"
+            summary = f"예기치 않은 오류: {exc}"
             self.record_execution(command_name, "failed", self.config.checkout_path, 0.0, summary)
-            return f"Unexpected error while running {command_name}: {exc}"
+            return f"`{command_name}` 실행 중 예기치 않은 오류가 발생했어요.\n{exc}"
 
         if result.timed_out:
             self.record_execution(
@@ -1419,9 +1871,9 @@ class CodexDiscordBot(commands.Bot):
                 "failed",
                 self.config.checkout_path,
                 result.duration_seconds,
-                f"timed out after {self.config.timeout_seconds}s",
+                f"{self.config.timeout_seconds}초 초과로 중단됨",
             )
-            return f"{command_name} timed out after {self.config.timeout_seconds} seconds."
+            return f"`{command_name}` 작업이 {self.config.timeout_seconds}초 안에 끝나지 않아 중단됐어요."
 
         status = "success" if result.returncode == 0 else "failed"
         self.record_execution(
@@ -1429,19 +1881,19 @@ class CodexDiscordBot(commands.Bot):
             status,
             self.config.checkout_path,
             result.duration_seconds,
-            f"exit code {result.returncode}",
+            f"종료 코드 {result.returncode}",
         )
 
-        lines = [f"command: {' '.join(args)}", f"exit code: {result.returncode}"]
+        lines = [f"명령어: {' '.join(args)}", f"종료 코드: {result.returncode}"]
         if result.stdout:
             lines.append("")
-            lines.append(f"stdout:\n{result.stdout}")
+            lines.append(f"표준 출력:\n{result.stdout}")
         if result.stderr:
             lines.append("")
-            lines.append(f"stderr:\n{result.stderr}")
+            lines.append(f"표준 오류:\n{result.stderr}")
         if not result.stdout and not result.stderr:
             lines.append("")
-            lines.append("(no output)")
+            lines.append("(출력 없음)")
         return "\n".join(lines)
 
     async def spawn_main_operation(self, operation: BackgroundOperation) -> None:
@@ -1482,12 +1934,12 @@ class CodexDiscordBot(commands.Bot):
 
     def format_background_operation_message(self, operation: BackgroundOperation) -> str:
         lines = [
-            f"{operation.command_name} requested.",
-            f"command: {' '.join(operation.args)}",
-            f"log: {operation.log_path}",
+            f"`{operation.command_name}` 작업을 백그라운드로 시작했어요.",
+            f"명령어: {' '.join(operation.args)}",
+            f"로그: {operation.log_path}",
         ]
         if operation.command_name == "deploy":
-            lines.append("The main bot may restart before posting a final follow-up message.")
+            lines.append("배포 중에는 main 봇이 먼저 재시작되어 최종 완료 메시지가 늦게 오거나 생략될 수 있어요.")
         return "\n".join(lines)
 
     async def background_notification_loop(self) -> None:
@@ -1539,19 +1991,24 @@ class CodexDiscordBot(commands.Bot):
                 command_args = payload.get("args", [])
                 error_message = payload.get("error_message")
                 lines = [
-                    f"{command_name} completed.",
-                    f"status: {status}",
+                    f"`{command_name}` 작업이 완료됐어요.",
+                    f"상태: {self.format_background_status(str(status))}",
                 ]
                 if isinstance(returncode, int):
-                    lines.append(f"exit code: {returncode}")
+                    lines.append(f"종료 코드: {returncode}")
                 if isinstance(command_args, list) and all(isinstance(item, str) for item in command_args):
-                    lines.append(f"command: {' '.join(command_args)}")
-                lines.append(f"log: {log_path}")
+                    lines.append(f"명령어: {' '.join(command_args)}")
+                lines.append(f"로그: {log_path}")
                 if isinstance(error_message, str) and error_message.strip():
-                    lines.append(f"error: {error_message}")
+                    lines.append(f"오류: {error_message}")
 
                 try:
-                    await channel.send("\n".join(lines))
+                    await self.send_channel_embed(
+                        channel,
+                        title="백그라운드 작업 완료",
+                        description="\n".join(lines),
+                        tone="success" if status == "succeeded" else "error",
+                    )
                 except discord.HTTPException:
                     logging.exception("Failed to send background operation completion message to channel %s", channel_id)
                     continue
@@ -1567,8 +2024,14 @@ class CodexDiscordBot(commands.Bot):
             return
 
         latency_ms = round(self.latency * 1000)
-        await interaction.response.send_message(
-            f"pong\nrole: {self.config.bot_role}\nlatency_ms: {latency_ms}"
+        await self.send_interaction_embed(
+            interaction,
+            title="봇 응답 정상",
+            description=(
+                f"역할: `{self.config.bot_role}`\n"
+                f"지연 시간: `{latency_ms}ms`"
+            ),
+            tone="success",
         )
 
     async def handle_new_session(self, interaction: discord.Interaction, target_bot_role: str, title: str) -> None:
@@ -1579,14 +2042,20 @@ class CodexDiscordBot(commands.Bot):
 
         parent_channel, workspace = self.resolve_session_parent_channel(interaction)
         if parent_channel is None:
-            await interaction.response.send_message(
-                f"`/{command_name_for_role('new-session', self.config.bot_role)}` must be used in a mapped parent channel.",
+            await self.send_interaction_embed(
+                interaction,
+                title="채널 연결 필요",
+                description=f"`/{command_name_for_role('new-session', self.config.bot_role)}` 명령은 워크스페이스가 연결된 부모 채널에서만 사용할 수 있어요.",
+                tone="warning",
                 ephemeral=True,
             )
             return
         if workspace is None:
-            await interaction.response.send_message(
-                "This channel is not mapped to a workspace.",
+            await self.send_interaction_embed(
+                interaction,
+                title="워크스페이스 없음",
+                description="이 채널에는 아직 워크스페이스가 연결되어 있지 않아요.",
+                tone="warning",
                 ephemeral=True,
             )
             return
@@ -1598,23 +2067,36 @@ class CodexDiscordBot(commands.Bot):
                 name=thread_name,
                 auto_archive_duration=1440,
                 type=discord.ChannelType.public_thread,
-                reason=f"New Codex session for {resolved_target_role}",
+                reason=f"새 Codex 세션 생성: {resolved_target_role}",
             )
         except discord.Forbidden:
-            await interaction.response.send_message(
-                "Unable to create a thread in this channel. Check the bot's thread permissions.",
+            await self.send_interaction_embed(
+                interaction,
+                title="스레드 생성 실패",
+                description="이 채널에서 스레드를 만들 권한이 없어요. 봇의 스레드 권한을 확인해 주세요.",
+                tone="error",
                 ephemeral=True,
             )
             return
         except discord.HTTPException as exc:
-            await interaction.response.send_message(
-                f"Unable to create a new session thread: {exc}",
+            await self.send_interaction_embed(
+                interaction,
+                title="세션 생성 실패",
+                description=f"새 세션 스레드를 만들지 못했어요.\n`{exc}`",
+                tone="error",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.send_message(
-            f"Created session for `{resolved_target_role}`: {thread.mention}\nworkspace: {workspace}"
+        await self.send_interaction_embed(
+            interaction,
+            title="세션 생성 완료",
+            description=(
+                f"대상 봇: `{resolved_target_role}`\n"
+                f"스레드: {thread.mention}\n"
+                f"워크스페이스: `{workspace}`"
+            ),
+            tone="success",
         )
 
     async def handle_status(self, interaction: discord.Interaction) -> None:
@@ -1626,8 +2108,7 @@ class CodexDiscordBot(commands.Bot):
             return
 
         await interaction.response.defer(thinking=True)
-        status_text = await self.build_status_text(interaction)
-        await self.send_output(interaction, status_text, filename_prefix="status")
+        await self.send_status_embed(interaction)
 
     async def handle_diff(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
@@ -1641,14 +2122,19 @@ class CodexDiscordBot(commands.Bot):
         target_path = workspace or self.config.checkout_path
 
         await interaction.response.defer(thinking=True)
-        diff_text = await self.build_diff_text(target_path)
-        await self.send_output(interaction, diff_text, filename_prefix="diff")
+        await self.send_diff_embed(interaction, target_path)
 
     async def handle_restart_staging(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
         if self.config.bot_role != "main":
-            await interaction.response.send_message("`/restart-staging` is only available on the main bot.", ephemeral=True)
+            await self.send_interaction_embed(
+                interaction,
+                title="main 봇 전용 명령",
+                description="`/restart-staging` 명령은 main 봇에서만 사용할 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
             return
         if not await self.ensure_session_context(interaction, "restart-staging"):
             return
@@ -1663,32 +2149,54 @@ class CodexDiscordBot(commands.Bot):
         if not await self.ensure_allowed_or_reply(interaction):
             return
         if self.config.bot_role != "main":
-            await interaction.response.send_message("`/restart` is only available on the main bot.", ephemeral=True)
+            await self.send_interaction_embed(
+                interaction,
+                title="main 봇 전용 명령",
+                description="`/restart` 명령은 main 봇에서만 사용할 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
             return
         if not await self.ensure_session_context(interaction, "restart"):
             return
         if not await self.ensure_thread_owned(interaction):
             return
 
-        self.record_execution("restart", "requested", self.config.checkout_path, 0.0, "restart requested")
+        self.record_execution("restart", "requested", self.config.checkout_path, 0.0, "재시작 요청 접수")
         operation = self.create_background_operation("restart", self.config.restart_args, interaction.channel_id)
-        await interaction.response.send_message(self.format_background_operation_message(operation))
+        await self.send_interaction_embed(
+            interaction,
+            title="재시작 요청 접수",
+            description=self.format_background_operation_message(operation),
+            tone="warning",
+        )
         asyncio.create_task(self.spawn_main_operation(operation))
 
     async def handle_deploy(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
         if self.config.bot_role != "main":
-            await interaction.response.send_message("`/deploy` is only available on the main bot.", ephemeral=True)
+            await self.send_interaction_embed(
+                interaction,
+                title="main 봇 전용 명령",
+                description="`/deploy` 명령은 main 봇에서만 사용할 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
             return
         if not await self.ensure_session_context(interaction, "deploy"):
             return
         if not await self.ensure_thread_owned(interaction):
             return
 
-        self.record_execution("deploy", "requested", self.config.checkout_path, 0.0, "deploy requested")
+        self.record_execution("deploy", "requested", self.config.checkout_path, 0.0, "배포 요청 접수")
         operation = self.create_background_operation("deploy", self.config.deploy_args, interaction.channel_id)
-        await interaction.response.send_message(self.format_background_operation_message(operation))
+        await self.send_interaction_embed(
+            interaction,
+            title="배포 요청 접수",
+            description=self.format_background_operation_message(operation),
+            tone="warning",
+        )
         asyncio.create_task(self.spawn_main_operation(operation))
 
 
@@ -1699,18 +2207,18 @@ def get_bot_from_interaction(interaction: discord.Interaction) -> CodexDiscordBo
     return client
 
 
-@app_commands.command(name="ping", description="Check whether the bot is alive. Channel only.")
+@app_commands.command(name="ping", description="봇이 살아 있는지 확인합니다. 채널 전용.")
 async def ping_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_ping(interaction)
 
 
-@app_commands.command(name="new-session", description="Create a new session thread bound to a selected bot. Channel only.")
-@app_commands.describe(target_bot_role="Which bot should own the new session. Defaults to main", title="Thread title for the new session")
+@app_commands.command(name="new-session", description="선택한 봇에 연결된 새 세션 스레드를 만듭니다. 채널 전용.")
+@app_commands.describe(target_bot_role="새 세션을 맡을 봇입니다. 기본값은 main", title="새 세션 스레드 제목")
 @app_commands.choices(
     target_bot_role=[
-        app_commands.Choice(name="main", value="main"),
-        app_commands.Choice(name="staging", value="staging"),
+        app_commands.Choice(name="메인", value="main"),
+        app_commands.Choice(name="스테이징", value="staging"),
     ]
 )
 async def new_session_command(
@@ -1722,31 +2230,31 @@ async def new_session_command(
     await bot.handle_new_session(interaction, target_bot_role.value if target_bot_role else "main", title)
 
 
-@app_commands.command(name="status", description="Show bot role, checkout, and recent status. Thread only.")
+@app_commands.command(name="status", description="봇 역할, 체크아웃, 최근 상태를 보여줍니다. 스레드 전용.")
 async def status_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_status(interaction)
 
 
-@app_commands.command(name="diff", description="Show changed files and diff stat for the current workspace or checkout. Thread only.")
+@app_commands.command(name="diff", description="현재 워크스페이스 또는 체크아웃의 변경 파일과 diff 통계를 보여줍니다. 스레드 전용.")
 async def diff_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_diff(interaction)
 
 
-@app_commands.command(name="restart", description="Restart the main bot service. Main bot only. Channel or thread.")
+@app_commands.command(name="restart", description="main 봇 서비스를 재시작합니다. main 봇 전용. 채널/스레드 사용 가능.")
 async def restart_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_restart(interaction)
 
 
-@app_commands.command(name="restart-staging", description="Restart the staging bot service. Main bot only. Channel or thread.")
+@app_commands.command(name="restart-staging", description="staging 봇 서비스를 재시작합니다. main 봇 전용. 채널/스레드 사용 가능.")
 async def restart_staging_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_restart_staging(interaction)
 
 
-@app_commands.command(name="deploy", description="Run the configured deploy script. Main bot only. Channel or thread.")
+@app_commands.command(name="deploy", description="설정된 배포 스크립트를 실행합니다. main 봇 전용. 채널/스레드 사용 가능.")
 async def deploy_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_deploy(interaction)

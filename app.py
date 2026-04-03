@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,10 +20,7 @@ DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_HISTORY_MESSAGES = 20
 DEFAULT_MAX_PROMPT_CHARS = 12000
 THREAD_BINDING_PATTERN = re.compile(r"^\[bot:(main|staging)\]\s*")
-BOT_CONTEXT_SKIP_PREFIXES = (
-    "A Codex task is already running in this thread.",
-    "Output was too long, attached as `",
-)
+STATE_DIRECTORY_NAME = ".codex-discord-state"
 
 
 class ConfigError(Exception):
@@ -69,6 +65,24 @@ class ExecutionRecord:
     summary: str
 
 
+@dataclass
+class ThreadSessionRecord:
+    session_id: str
+    workspace: Path
+    updated_at: str
+
+
+@dataclass
+class CodexTurnResult:
+    session_id: str | None
+    messages: list[str]
+    file_changes: list[str]
+    returncode: int | None
+    stderr: str
+    duration_seconds: float
+    timed_out: bool = False
+
+
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -95,40 +109,6 @@ def chunk_text(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
-def sanitize_bot_context_message(text: str) -> str:
-    stripped = text.strip()
-    if not stripped:
-        return ""
-    if any(stripped.startswith(prefix) for prefix in BOT_CONTEXT_SKIP_PREFIXES):
-        return ""
-
-    if stripped.startswith("workspace: "):
-        _, _, remainder = stripped.partition("\n\n")
-        if remainder.strip():
-            stripped = remainder.strip()
-
-    stderr_marker = "\n\nstderr:\n"
-    if stderr_marker in stripped:
-        stripped = stripped.split(stderr_marker, 1)[0].rstrip()
-
-    return stripped
-
-
-def format_codex_user_response(
-    result: "ProcessResult",
-    output_text: str,
-    timeout_seconds: int,
-) -> str:
-    if result.timed_out:
-        return f"codex exec timed out after {timeout_seconds} seconds."
-
-    if result.returncode == 0:
-        return output_text or result.stdout or "codex exec finished without output."
-
-    if output_text:
-        return output_text
-
-    return f"codex exec failed with exit code {result.returncode}."
 def split_thread_binding(name: str) -> tuple[str | None, str]:
     match = THREAD_BINDING_PATTERN.match(name)
     if match is None:
@@ -165,6 +145,54 @@ def parse_command_args(name: str, value: object, default: list[str] | None = Non
     if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
         raise ConfigError(f"{name} must be a JSON array of non-empty strings")
     return list(value)
+
+
+def message_to_prompt(message: discord.Message) -> str:
+    parts: list[str] = []
+    content = message.content.strip()
+    if content:
+        parts.append(content)
+
+    if message.attachments:
+        attachment_lines = [f"- {attachment.filename}: {attachment.url}" for attachment in message.attachments]
+        parts.append("Attachments:\n" + "\n".join(attachment_lines))
+
+    return "\n\n".join(parts).strip()
+
+
+def strip_resume_unsupported_args(args: list[str]) -> list[str]:
+    # `codex exec resume` does not accept every option that `codex exec` accepts.
+    options_with_values_to_skip = {
+        "--color",
+        "--cd",
+        "-C",
+        "-o",
+        "--output-last-message",
+    }
+    value_less_to_skip = {"--json"}
+    filtered: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in options_with_values_to_skip:
+            index += 2
+            continue
+        if arg in value_less_to_skip:
+            index += 1
+            continue
+        filtered.append(arg)
+        index += 1
+    return filtered
+
+
+def summarize_file_changes(file_changes: list[str]) -> str:
+    if not file_changes:
+        return ""
+    lines = ["Changed files:"]
+    lines.extend(f"- {item}" for item in file_changes[:20])
+    if len(file_changes) > 20:
+        lines.append(f"- ... and {len(file_changes) - 20} more")
+    return "\n".join(lines)
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
@@ -335,6 +363,76 @@ def load_app_config() -> AppConfig:
     )
 
 
+class SessionStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._records: dict[str, ThreadSessionRecord] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.is_file():
+            return
+
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logging.exception("Failed to load session store from %s", self.path)
+            return
+
+        raw_threads = payload.get("threads", {})
+        if not isinstance(raw_threads, dict):
+            return
+
+        for thread_id, raw_record in raw_threads.items():
+            if not isinstance(raw_record, dict):
+                continue
+            session_id = raw_record.get("session_id")
+            workspace = raw_record.get("workspace")
+            updated_at = raw_record.get("updated_at")
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            if not isinstance(workspace, str) or not workspace:
+                continue
+            if not isinstance(updated_at, str) or not updated_at:
+                updated_at = now_utc_iso()
+            self._records[thread_id] = ThreadSessionRecord(
+                session_id=session_id,
+                workspace=Path(workspace),
+                updated_at=updated_at,
+            )
+
+    def _save(self) -> None:
+        payload = {
+            "threads": {
+                thread_id: {
+                    "session_id": record.session_id,
+                    "workspace": str(record.workspace),
+                    "updated_at": record.updated_at,
+                }
+                for thread_id, record in self._records.items()
+            }
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def get(self, thread_id: int) -> ThreadSessionRecord | None:
+        return self._records.get(str(thread_id))
+
+    def set(self, thread_id: int, session_id: str, workspace: Path) -> None:
+        self._records[str(thread_id)] = ThreadSessionRecord(
+            session_id=session_id,
+            workspace=workspace.resolve(),
+            updated_at=now_utc_iso(),
+        )
+        self._save()
+
+    def delete(self, thread_id: int) -> None:
+        if str(thread_id) not in self._records:
+            return
+        self._records.pop(str(thread_id), None)
+        self._save()
+
+
 class CodexDiscordBot(commands.Bot):
     def __init__(self, config: AppConfig) -> None:
         intents = discord.Intents.default()
@@ -346,6 +444,8 @@ class CodexDiscordBot(commands.Bot):
         self.config = config
         self.thread_locks: dict[int, asyncio.Lock] = {}
         self.last_execution: ExecutionRecord | None = None
+        state_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"{self.config.bot_role}-sessions.json"
+        self.session_store = SessionStore(state_path)
 
     async def setup_hook(self) -> None:
         guild = discord.Object(id=self.config.guild_id) if self.config.guild_id else None
@@ -399,6 +499,9 @@ class CodexDiscordBot(commands.Bot):
             return
         if thread_target_role(thread.name) != self.config.bot_role:
             return
+        prompt = message_to_prompt(message)
+        if not prompt:
+            return
 
         lock = self.get_thread_lock(thread.id)
         if lock.locked():
@@ -407,8 +510,7 @@ class CodexDiscordBot(commands.Bot):
 
         async with lock:
             async with thread.typing():
-                full_prompt = await self.build_thread_prompt(thread)
-                response_text = await self.run_codex(full_prompt, workspace)
+                response_text = await self.run_codex_turn_for_message(thread, workspace, prompt)
             await self.send_message_output(message, response_text, filename_prefix=f"message-{thread.id}")
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
@@ -595,95 +697,129 @@ class CodexDiscordBot(commands.Bot):
                 timed_out=True,
             )
 
-    async def build_thread_prompt(self, thread: discord.Thread) -> str:
-        lines = [
-            "You are running inside a Discord-driven Codex wrapper.",
-            "The working directory is already set to the mapped development workspace.",
-            "Only operate inside that workspace.",
-            "Respond to the latest user message in this thread while using prior thread messages as context.",
-            "",
-            f"Thread title: {thread.name}",
-            f"Thread id: {thread.id}",
-            "",
-            "Previous conversation:",
+    def get_thread_session(self, thread_id: int, workspace: Path) -> ThreadSessionRecord | None:
+        record = self.session_store.get(thread_id)
+        if record is None:
+            return None
+        if record.workspace.resolve() != workspace.resolve():
+            self.session_store.delete(thread_id)
+            return None
+        return record
+
+    def build_codex_exec_args(self, workspace: Path, prompt: str) -> list[str]:
+        return [
+            self.config.codex_bin,
+            "exec",
+            "--json",
+            "-C",
+            str(workspace),
+            *self.config.codex_exec_args,
+            prompt,
         ]
 
-        async for item in thread.history(limit=self.config.history_messages, oldest_first=True):
-            if item.type != discord.MessageType.default:
+    def build_codex_resume_args(self, session_id: str, prompt: str) -> list[str]:
+        return [
+            self.config.codex_bin,
+            "exec",
+            "resume",
+            "--json",
+            *strip_resume_unsupported_args(self.config.codex_exec_args),
+            session_id,
+            prompt,
+        ]
+
+    def parse_codex_json_output(self, stdout_text: str) -> tuple[str | None, list[str], list[str], list[str]]:
+        session_id: str | None = None
+        agent_messages: list[str] = []
+        file_changes: list[str] = []
+        raw_lines: list[str] = []
+
+        for line in stdout_text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                raw_lines.append(stripped)
                 continue
 
-            is_bot_message = self.user is not None and item.author.id == self.user.id
-            is_allowed_user_message = item.author.id == self.config.allowed_user_id
-            if not is_bot_message and not is_allowed_user_message:
+            if not isinstance(event, dict):
                 continue
 
-            content = item.content.strip()
-            if not content and not item.attachments:
+            event_type = event.get("type")
+            if event_type == "thread.started":
+                maybe_session_id = event.get("thread_id")
+                if isinstance(maybe_session_id, str) and maybe_session_id:
+                    session_id = maybe_session_id
                 continue
 
-            if item.attachments:
-                attachments = [f"attachment: {attachment.filename} ({attachment.url})" for attachment in item.attachments]
-                content = "\n".join(filter(None, [content, *attachments]))
+            if event_type != "item.completed":
+                continue
 
-            if is_bot_message:
-                content = sanitize_bot_context_message(content)
-                if not content and not item.attachments:
+            item = event.get("item")
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type")
+            if item_type == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    agent_messages.append(text.strip())
+                continue
+
+            if item_type == "file_change":
+                changes = item.get("changes")
+                if not isinstance(changes, list):
                     continue
+                for change in changes:
+                    if not isinstance(change, dict):
+                        continue
+                    path = change.get("path")
+                    kind = change.get("kind")
+                    if isinstance(path, str) and path:
+                        if isinstance(kind, str) and kind:
+                            file_changes.append(f"{kind}: {path}")
+                        else:
+                            file_changes.append(path)
 
-            role = "assistant" if is_bot_message else "user"
-            lines.append(f"[{role}] {item.author.display_name}:")
-            lines.append(content)
-            lines.append("")
+        return session_id, agent_messages, file_changes, raw_lines
 
-        full_prompt = "\n".join(lines).strip()
-        if len(full_prompt) > self.config.max_prompt_chars:
-            full_prompt = (
-                "The earlier thread context was truncated to fit the configured prompt size.\n\n"
-                + full_prompt[-self.config.max_prompt_chars :]
+    async def run_codex_turn(self, workspace: Path, prompt: str, session_id: str | None) -> CodexTurnResult:
+        args = (
+            self.build_codex_resume_args(session_id, prompt)
+            if session_id
+            else self.build_codex_exec_args(workspace, prompt)
+        )
+        result = await self.run_process(args=args, cwd=workspace)
+        parsed_session_id, messages, file_changes, raw_lines = self.parse_codex_json_output(result.stdout)
+        effective_session_id = parsed_session_id or session_id
+        if raw_lines:
+            logging.warning("Non-JSON codex output workspace=%s lines=%s", workspace, raw_lines)
+        if result.stderr:
+            logging.warning(
+                "codex exec stderr workspace=%s returncode=%s stderr=%s",
+                workspace,
+                result.returncode,
+                result.stderr,
             )
-        return full_prompt
 
-    async def run_codex(self, prompt: str, workspace: Path) -> str:
-        temp_output_path: str | None = None
+        return CodexTurnResult(
+            session_id=effective_session_id,
+            messages=messages,
+            file_changes=file_changes,
+            returncode=result.returncode,
+            stderr=result.stderr,
+            duration_seconds=result.duration_seconds,
+            timed_out=result.timed_out,
+        )
+
+    async def run_codex_turn_for_message(self, thread: discord.Thread, workspace: Path, prompt: str) -> str:
+        record = self.get_thread_session(thread.id, workspace)
+        prior_session_id = record.session_id if record else None
+
         try:
-            with tempfile.NamedTemporaryFile(prefix="codex-discord-", suffix=".txt", delete=False) as temp_file:
-                temp_output_path = temp_file.name
-
-            args = [
-                self.config.codex_bin,
-                "exec",
-                "-C",
-                str(workspace),
-                "-o",
-                temp_output_path,
-                *self.config.codex_exec_args,
-                prompt,
-            ]
-
-            result = await self.run_process(args=args, cwd=workspace)
-
-            output_text = ""
-            if temp_output_path and Path(temp_output_path).is_file():
-                output_text = Path(temp_output_path).read_text(encoding="utf-8", errors="replace").strip()
-            response_text = format_codex_user_response(
-                result=result,
-                output_text=output_text,
-                timeout_seconds=self.config.timeout_seconds,
-            )
-
-            if result.stderr:
-                logging.warning(
-                    "codex exec stderr workspace=%s returncode=%s stderr=%s",
-                    workspace,
-                    result.returncode,
-                    result.stderr,
-                )
-
-            status = "success" if result.returncode == 0 and not result.timed_out else "failed"
-            summary = f"{status} in {result.duration_seconds:.1f}s"
-            self.record_execution("ask", status, workspace, result.duration_seconds, summary)
-
-            return response_text
+            result = await self.run_codex_turn(workspace, prompt, prior_session_id)
         except FileNotFoundError:
             summary = f"missing executable: {self.config.codex_bin}"
             self.record_execution("ask", "failed", workspace, 0.0, summary)
@@ -693,12 +829,51 @@ class CodexDiscordBot(commands.Bot):
             summary = f"unexpected error: {exc}"
             self.record_execution("ask", "failed", workspace, 0.0, summary)
             return f"Unexpected error while running codex exec: {exc}"
-        finally:
-            if temp_output_path:
-                try:
-                    Path(temp_output_path).unlink(missing_ok=True)
-                except OSError:
-                    logging.warning("Failed to remove temporary output file: %s", temp_output_path)
+
+        if result.session_id:
+            self.session_store.set(thread.id, result.session_id, workspace)
+
+        if result.timed_out:
+            self.record_execution(
+                "ask",
+                "failed",
+                workspace,
+                result.duration_seconds,
+                f"timed out after {self.config.timeout_seconds}s",
+            )
+            return f"codex exec timed out after {self.config.timeout_seconds} seconds."
+
+        if result.returncode != 0:
+            self.record_execution(
+                "ask",
+                "failed",
+                workspace,
+                result.duration_seconds,
+                f"exit code {result.returncode}",
+            )
+            lines = [f"codex exec failed with exit code {result.returncode}."]
+            if result.stderr:
+                lines.append("")
+                lines.append(f"stderr:\n{result.stderr}")
+            return "\n".join(lines)
+
+        response_sections: list[str] = []
+        if result.messages:
+            response_sections.append("\n\n".join(result.messages))
+
+        file_change_summary = summarize_file_changes(result.file_changes)
+        if file_change_summary:
+            response_sections.append(file_change_summary)
+
+        if result.session_id:
+            summary = f"success in {result.duration_seconds:.1f}s session={result.session_id}"
+        else:
+            summary = f"success in {result.duration_seconds:.1f}s"
+        self.record_execution("ask", "success", workspace, result.duration_seconds, summary)
+
+        if response_sections:
+            return "\n\n".join(response_sections)
+        return "codex exec finished without output."
 
     async def get_git_summary(self, target_path: Path) -> str:
         inside_repo = await self.run_process(
@@ -744,8 +919,11 @@ class CodexDiscordBot(commands.Bot):
     async def build_status_text(self, interaction: discord.Interaction) -> str:
         thread, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
         current_thread_busy = False
+        thread_session: ThreadSessionRecord | None = None
         if thread is not None:
             current_thread_busy = self.get_thread_lock(thread.id).locked()
+            if workspace is not None:
+                thread_session = self.get_thread_session(thread.id, workspace)
 
         lines = [
             f"role: {self.config.bot_role}",
@@ -758,6 +936,12 @@ class CodexDiscordBot(commands.Bot):
             lines.append(f"thread workspace: {workspace}")
         else:
             lines.append("thread workspace: (not in a mapped thread)")
+
+        if thread_session is not None:
+            lines.append(f"thread session id: {thread_session.session_id}")
+            lines.append(f"thread session updated: {thread_session.updated_at}")
+        else:
+            lines.append("thread session id: (none)")
 
         if self.last_execution is None:
             lines.append("last execution: none")

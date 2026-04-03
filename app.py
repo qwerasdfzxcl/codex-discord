@@ -33,7 +33,6 @@ class AppConfig:
     token: str
     allowed_user_id: int
     checkout_path: Path
-    staging_workspace_root: Path
     guild_id: int | None
     channel_workspaces: dict[int, Path]
     timeout_seconds: int
@@ -133,21 +132,17 @@ def configure_logging() -> None:
     )
 
 
-def infer_checkout_paths(bot_role: str) -> tuple[Path, Path]:
+def infer_checkout_path(bot_role: str) -> Path:
     checkout_path = Path(__file__).resolve().parent
     container_root = checkout_path.parent
     expected_checkout_name = "main" if bot_role == "main" else "staging"
     expected_checkout_path = (container_root / expected_checkout_name).resolve()
-    staging_workspace_root = (container_root / "staging").resolve()
 
     if checkout_path != expected_checkout_path:
         raise ConfigError(
             f"BOT_ROLE={bot_role} expects app.py under {expected_checkout_path}, got {checkout_path}"
         )
-    if not staging_workspace_root.is_dir():
-        raise ConfigError(f"Derived staging workspace root does not exist: {staging_workspace_root}")
-
-    return checkout_path, staging_workspace_root
+    return checkout_path
 
 
 def read_env_settings() -> dict[str, object]:
@@ -170,18 +165,15 @@ def read_env_settings() -> dict[str, object]:
         raise ConfigError("CODEX_DISCORD_CONFIG must not be empty")
 
     guild_id_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
-    checkout_path, staging_workspace_root = infer_checkout_paths(bot_role)
-    config_path = (checkout_path / config_path_raw).expanduser().resolve()
+    checkout_path = infer_checkout_path(bot_role)
+    raw_config_path = Path(config_path_raw).expanduser()
+    if raw_config_path.is_absolute():
+        config_path = raw_config_path.resolve()
+    else:
+        config_path = (checkout_path / raw_config_path).resolve()
 
     if not checkout_path.is_dir():
         raise ConfigError(f"Derived checkout path does not exist: {checkout_path}")
-    if not staging_workspace_root.is_dir():
-        raise ConfigError(f"Derived staging workspace root does not exist: {staging_workspace_root}")
-
-    if bot_role == "staging" and not is_relative_to(checkout_path, staging_workspace_root):
-        raise ConfigError("staging bot checkout path must stay inside the derived staging workspace root")
-    if bot_role == "main" and is_relative_to(checkout_path, staging_workspace_root):
-        raise ConfigError("main bot checkout path must not be inside the derived staging workspace root")
 
     guild_id = int(guild_id_raw) if guild_id_raw else None
 
@@ -190,7 +182,6 @@ def read_env_settings() -> dict[str, object]:
         "allowed_user_id": int(allowed_user_raw),
         "bot_role": bot_role,
         "checkout_path": checkout_path,
-        "staging_workspace_root": staging_workspace_root,
         "config_path": config_path,
         "guild_id": guild_id,
     }
@@ -211,8 +202,9 @@ def load_app_config() -> AppConfig:
     if not raw_channels:
         raise ConfigError("channels must contain at least one channel_id -> workspace mapping")
 
-    staging_workspace_root = env_settings["staging_workspace_root"]
-    assert isinstance(staging_workspace_root, Path)
+    checkout_path = env_settings["checkout_path"]
+    assert isinstance(checkout_path, Path)
+    config_dir = config_path.parent
 
     channel_workspaces: dict[int, Path] = {}
     for channel_id_raw, workspace_raw in raw_channels.items():
@@ -224,12 +216,12 @@ def load_app_config() -> AppConfig:
         if raw_workspace_path.is_absolute():
             workspace_path = raw_workspace_path.resolve()
         else:
-            workspace_path = (staging_workspace_root / raw_workspace_path).resolve()
+            workspace_path = (config_dir / raw_workspace_path).resolve()
         if not workspace_path.is_dir():
             raise ConfigError(f"workspace directory not found for channel {channel_id}: {workspace_path}")
-        if not is_relative_to(workspace_path, staging_workspace_root):
+        if env_settings["bot_role"] == "main" and is_relative_to(workspace_path, checkout_path):
             raise ConfigError(
-                f"workspace for channel {channel_id} must stay inside the staging workspace root: {workspace_path}"
+                f"main bot cannot map channel {channel_id} to its own checkout: {workspace_path}"
             )
 
         channel_workspaces[channel_id] = workspace_path
@@ -273,7 +265,6 @@ def load_app_config() -> AppConfig:
         token=str(env_settings["token"]),
         allowed_user_id=int(env_settings["allowed_user_id"]),
         checkout_path=env_settings["checkout_path"],
-        staging_workspace_root=staging_workspace_root,
         guild_id=env_settings["guild_id"],
         channel_workspaces=channel_workspaces,
         timeout_seconds=timeout_seconds,
@@ -642,7 +633,6 @@ class CodexDiscordBot(commands.Bot):
         lines = [
             f"role: {self.config.bot_role}",
             f"checkout: {self.config.checkout_path}",
-            f"staging workspace root: {self.config.staging_workspace_root}",
             f"active threads: {self.active_thread_count()}",
             f"current thread busy: {'yes' if current_thread_busy else 'no'}",
         ]

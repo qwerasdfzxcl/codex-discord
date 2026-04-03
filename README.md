@@ -1,6 +1,6 @@
 # codex-discord
 
-Discord slash command로 Codex CLI를 감싸는 개인용 최소 wrapper입니다. 현재 구조는 실제 git worktree 기반입니다. `main` bot은 `main/` checkout에서 실행되고, `staging` bot은 `staging/` checkout에서 실행됩니다. Codex 작업 대상은 항상 컨테이너 루트 아래의 `staging/`만 허용되므로, 운영 중인 main checkout을 Codex가 직접 수정하지 않게 막습니다.
+Discord slash command로 Codex CLI를 감싸는 개인용 최소 wrapper입니다. 현재 구조는 실제 git worktree 기반입니다. `main` bot은 `main/` checkout에서 실행되고, `staging` bot은 `staging/` checkout에서 실행됩니다. 각 Discord 채널은 config에서 지정한 임의의 외부 repository path에 직접 매핑됩니다. 다만 `main` bot은 자기 자신의 `main/` checkout을 workspace로 쓰지 못하게 막아서, 운영 중인 wrapper 코드를 직접 수정하지 않게 해둔 상태입니다.
 
 ## 핵심 동작
 
@@ -99,18 +99,15 @@ LOG_LEVEL=INFO
 - `CODEX_DISCORD_CONFIG`: 현재 checkout 기준 설정 파일 경로. 기본값은 `config/config.json`
 - `DISCORD_GUILD_ID`: 지정하면 해당 guild에만 slash command를 빠르게 sync
 
-`CHECKOUT_PATH`와 `DEV_WORKSPACE_ROOT`는 env에서 받지 않습니다.
-
-- 현재 실행 중인 `app.py` 위치가 자동으로 현재 checkout 경로가 됩니다.
-- 그 checkout의 상위 디렉터리 아래 `staging/`를 개발 workspace root로 자동 사용합니다.
+별도의 checkout 경로 환경변수는 받지 않습니다. 현재 실행 중인 `app.py` 위치가 자동으로 현재 checkout 경로가 됩니다.
 
 ## config/config.json 설정
 
 ```json
 {
   "channels": {
-    "111111111111111111": ".",
-    "222222222222222222": "subproject"
+    "111111111111111111": "/home/ubuntu/codex-discord/staging",
+    "222222222222222222": "/home/ubuntu/asdf"
   },
   "timeout_seconds": 900,
   "history_messages": 20,
@@ -146,10 +143,11 @@ LOG_LEVEL=INFO
 
 중요:
 
-- `channels`는 절대경로를 써도 되고, 상대경로를 쓰면 자동으로 `staging/` 기준으로 해석됩니다.
-- `.`는 `staging/` 자체를 의미합니다.
-- 모든 workspace는 최종적으로 `staging/` 아래여야 합니다.
-- 그래서 `main` bot이 main checkout에서 실행되더라도 `/ask`는 staging workspace만 수정합니다.
+- `channels` 값은 각 채널이 실제로 관리할 repository/workspace 경로입니다.
+- 절대경로를 권장합니다.
+- 상대경로를 쓰면 현재 `config.json` 파일이 있는 디렉터리 기준으로 해석됩니다.
+- `main` bot은 자기 자신의 `main/` checkout을 workspace로 매핑할 수 없습니다.
+- `codex-discord` 프로젝트 자체를 관리하려면 채널을 `.../codex-discord/staging`에 매핑해야 합니다.
 
 ## 실행
 
@@ -190,8 +188,8 @@ sudo systemctl enable --now codex-discord-staging
 
 `scripts/deploy-prod.sh`는 git 기반 예시입니다.
 
-- `prod` checkout에서 `staging` 브랜치를 `main`에 merge
-- merge가 성공하면 prod 서비스 재시작
+- `main` checkout에서 `staging` 브랜치를 `main`에 merge
+- merge가 성공하면 main 서비스 재시작
 
 실제 운영 전에 다음은 반드시 검토해야 합니다.
 

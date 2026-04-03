@@ -21,23 +21,6 @@ DEFAULT_HISTORY_MESSAGES = 20
 DEFAULT_MAX_PROMPT_CHARS = 12000
 THREAD_BINDING_PATTERN = re.compile(r"^\[bot:(main|staging)\]\s*")
 STATE_DIRECTORY_NAME = ".codex-discord-state"
-DESTRUCTIVE_PROMPT_PATTERNS = (
-    r"\brm\b",
-    r"\bdel(?:ete)?\b",
-    r"\bremove\b",
-    r"\bunlink\b",
-    r"\berase\b",
-    r"\bdrop\s+table\b",
-    r"\btruncate\b",
-    r"\breset\s+--hard\b",
-    r"\bclean\s+-fd\b",
-    r"\bsudo\b",
-    r"삭제",
-    r"지워",
-    r"제거",
-    r"날려",
-    r"초기화",
-)
 
 
 class ConfigError(Exception):
@@ -64,16 +47,6 @@ class AppConfig:
 
 
 @dataclass
-class ProcessResult:
-    args: list[str]
-    returncode: int | None
-    stdout: str
-    stderr: str
-    duration_seconds: float
-    timed_out: bool = False
-
-
-@dataclass
 class ExecutionRecord:
     command_name: str
     status: str
@@ -84,6 +57,16 @@ class ExecutionRecord:
 
 
 @dataclass
+class ProcessResult:
+    args: list[str]
+    returncode: int | None
+    stdout: str
+    stderr: str
+    duration_seconds: float
+    timed_out: bool = False
+
+
+@dataclass
 class ThreadSessionRecord:
     session_id: str
     workspace: Path
@@ -91,22 +74,11 @@ class ThreadSessionRecord:
 
 
 @dataclass
-class CodexTurnResult:
-    session_id: str | None
-    messages: list[str]
-    file_changes: list[str]
-    returncode: int | None
-    stderr: str
-    duration_seconds: float
-    timed_out: bool = False
-
-
-@dataclass
 class PendingApproval:
-    thread_id: int
-    source_message_id: int
-    workspace: Path
-    prompt: str
+    runtime: "ThreadSessionRuntime"
+    request_id: int | str
+    method: str
+    params: dict[str, object]
     requested_at: str
 
 
@@ -185,48 +157,6 @@ def message_to_prompt(message: discord.Message) -> str:
         parts.append("Attachments:\n" + "\n".join(attachment_lines))
 
     return "\n\n".join(parts).strip()
-
-
-def strip_resume_unsupported_args(args: list[str]) -> list[str]:
-    # `codex exec resume` does not accept every option that `codex exec` accepts.
-    options_with_values_to_skip = {
-        "--color",
-        "--cd",
-        "-C",
-        "-o",
-        "--output-last-message",
-    }
-    value_less_to_skip = {"--json"}
-    filtered: list[str] = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg in options_with_values_to_skip:
-            index += 2
-            continue
-        if arg in value_less_to_skip:
-            index += 1
-            continue
-        filtered.append(arg)
-        index += 1
-    return filtered
-
-
-def summarize_file_changes(file_changes: list[str]) -> str:
-    if not file_changes:
-        return ""
-    lines = ["Changed files:"]
-    lines.extend(f"- {item}" for item in file_changes[:20])
-    if len(file_changes) > 20:
-        lines.append(f"- ... and {len(file_changes) - 20} more")
-    return "\n".join(lines)
-
-
-def prompt_requires_destructive_approval(prompt: str) -> bool:
-    lowered = prompt.strip().lower()
-    if not lowered:
-        return False
-    return any(re.search(pattern, lowered) for pattern in DESTRUCTIVE_PROMPT_PATTERNS)
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
@@ -473,7 +403,15 @@ class SessionStore:
         self._save()
 
 
-class ApprovalView(discord.ui.View):
+@dataclass
+class AppServerTurnState:
+    turn_id: str
+    source_message_id: int
+    completion_future: asyncio.Future[dict[str, object]]
+    agent_messages_sent: int = 0
+
+
+class AppServerApprovalView(discord.ui.View):
     def __init__(self, bot: "CodexDiscordBot", approval_id: str) -> None:
         super().__init__(timeout=3600)
         self.bot = bot
@@ -491,7 +429,7 @@ class ApprovalView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        await self.bot.handle_approval_click(interaction, self.approval_id, approved=True, view=self)
+        await self.bot.handle_app_server_approval_click(interaction, self.approval_id, approved=True, view=self)
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.secondary)
     async def deny(  # type: ignore[override]
@@ -499,7 +437,306 @@ class ApprovalView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        await self.bot.handle_approval_click(interaction, self.approval_id, approved=False, view=self)
+        await self.bot.handle_app_server_approval_click(interaction, self.approval_id, approved=False, view=self)
+
+
+class ThreadSessionRuntime:
+    def __init__(self, bot: "CodexDiscordBot", discord_thread_id: int, workspace: Path) -> None:
+        self.bot = bot
+        self.discord_thread_id = discord_thread_id
+        self.workspace = workspace.resolve()
+        self.process: asyncio.subprocess.Process | None = None
+        self.stdout_task: asyncio.Task[None] | None = None
+        self.stderr_task: asyncio.Task[None] | None = None
+        self.pending_requests: dict[int | str, asyncio.Future[dict[str, object]]] = {}
+        self.pending_turn_state: AppServerTurnState | None = None
+        self.current_turns: dict[str, AppServerTurnState] = {}
+        self.next_request_id = 1
+        self.started = False
+        self.start_lock = asyncio.Lock()
+        self.write_lock = asyncio.Lock()
+
+    async def ensure_started(self) -> None:
+        if self.process is not None and self.process.returncode is None and self.started:
+            return
+
+        async with self.start_lock:
+            if self.process is not None and self.process.returncode is None and self.started:
+                return
+
+            self.process = await asyncio.create_subprocess_exec(
+                self.bot.config.codex_bin,
+                "app-server",
+                "--listen",
+                "stdio://",
+                cwd=str(self.workspace),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self.stdout_task = asyncio.create_task(self.read_stdout_loop())
+            self.stderr_task = asyncio.create_task(self.read_stderr_loop())
+            request_id = self.next_request_id
+            self.next_request_id += 1
+            future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
+            self.pending_requests[request_id] = future
+            await self.write_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {
+                            "name": f"codex-discord-{self.bot.config.bot_role}",
+                            "version": "0.1",
+                        },
+                        "capabilities": None,
+                    },
+                }
+            )
+            await future
+            self.started = True
+
+    async def read_stdout_loop(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        stream = self.process.stdout
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            try:
+                message = json.loads(text)
+            except json.JSONDecodeError:
+                logging.warning("app-server non-JSON stdout thread=%s line=%s", self.discord_thread_id, text)
+                continue
+            await self.handle_rpc_message(message)
+
+        self.started = False
+        self.fail_pending(RuntimeError("app-server process exited"))
+
+    async def read_stderr_loop(self) -> None:
+        assert self.process is not None and self.process.stderr is not None
+        stream = self.process.stderr
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                logging.warning("app-server stderr thread=%s %s", self.discord_thread_id, text)
+
+    def fail_pending(self, error: Exception) -> None:
+        for future in self.pending_requests.values():
+            if not future.done():
+                future.set_exception(error)
+        self.pending_requests.clear()
+
+        if self.pending_turn_state and not self.pending_turn_state.completion_future.done():
+            self.pending_turn_state.completion_future.set_exception(error)
+        for state in self.current_turns.values():
+            if not state.completion_future.done():
+                state.completion_future.set_exception(error)
+        self.current_turns.clear()
+        self.pending_turn_state = None
+
+    async def handle_rpc_message(self, message: dict[str, object]) -> None:
+        message_id = message.get("id")
+        method = message.get("method")
+
+        if method is not None and message_id is not None:
+            params = message.get("params")
+            if isinstance(method, str) and isinstance(params, dict):
+                await self.bot.handle_app_server_request(self, message_id, method, params)
+            return
+
+        if message_id is not None:
+            future = self.pending_requests.pop(message_id, None)
+            if future is None:
+                return
+            if "error" in message:
+                future.set_exception(RuntimeError(str(message["error"])))
+                return
+            result = message.get("result")
+            if isinstance(result, dict):
+                future.set_result(result)
+            else:
+                future.set_result({})
+            return
+
+        if isinstance(method, str):
+            params = message.get("params")
+            if isinstance(params, dict):
+                await self.handle_notification(method, params)
+
+    async def handle_notification(self, method: str, params: dict[str, object]) -> None:
+        if method == "turn/started":
+            turn = params.get("turn")
+            if isinstance(turn, dict):
+                turn_id = turn.get("id")
+                if isinstance(turn_id, str) and self.pending_turn_state is not None:
+                    self.pending_turn_state.turn_id = turn_id
+                    self.current_turns[turn_id] = self.pending_turn_state
+                    self.pending_turn_state = None
+            return
+
+        if method == "item/completed":
+            turn_id = params.get("turnId")
+            item = params.get("item")
+            if not isinstance(turn_id, str) or not isinstance(item, dict):
+                return
+            turn_state = self.current_turns.get(turn_id)
+            if turn_state is None:
+                return
+
+            item_type = item.get("type")
+            if item_type == "agentMessage":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    await self.bot.post_agent_message(
+                        self.discord_thread_id,
+                        turn_state.source_message_id,
+                        text.strip(),
+                        reply_to_source=turn_state.agent_messages_sent == 0,
+                    )
+                    turn_state.agent_messages_sent += 1
+            return
+
+        if method == "turn/completed":
+            turn = params.get("turn")
+            if not isinstance(turn, dict):
+                return
+            turn_id = turn.get("id")
+            if not isinstance(turn_id, str):
+                return
+            turn_state = self.current_turns.pop(turn_id, None)
+            if turn_state is None:
+                return
+            if not turn_state.completion_future.done():
+                turn_state.completion_future.set_result(turn)
+
+            status = turn.get("status")
+            error = turn.get("error")
+            if turn_state.agent_messages_sent == 0:
+                if status == "failed" and isinstance(error, dict):
+                    message = error.get("message")
+                    if isinstance(message, str) and message.strip():
+                        await self.bot.post_agent_message(
+                            self.discord_thread_id,
+                            turn_state.source_message_id,
+                            f"Turn failed: {message}",
+                            reply_to_source=True,
+                        )
+                elif status == "interrupted":
+                    await self.bot.post_agent_message(
+                        self.discord_thread_id,
+                        turn_state.source_message_id,
+                        "Turn interrupted.",
+                        reply_to_source=True,
+                    )
+
+    async def write_json(self, payload: dict[str, object]) -> None:
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("app-server is not running")
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        async with self.write_lock:
+            self.process.stdin.write(data)
+            await self.process.stdin.drain()
+
+    async def send_request(self, method: str, params: dict[str, object] | None) -> dict[str, object]:
+        await self.ensure_started()
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
+        self.pending_requests[request_id] = future
+        payload: dict[str, object] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        await self.write_json(payload)
+        return await future
+
+    async def send_response(self, request_id: int | str, result: dict[str, object]) -> None:
+        if self.process is None or self.process.returncode is not None or not self.started:
+            raise RuntimeError("app-server is not running")
+        await self.write_json({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    async def ensure_codex_thread(self) -> str:
+        model = self.bot.resolve_codex_model()
+        resume_params: dict[str, object] = {
+            "threadId": "",
+            "cwd": str(self.workspace),
+            "approvalPolicy": self.bot.resolve_approval_policy(),
+            "approvalsReviewer": "user",
+            "sandbox": self.bot.resolve_sandbox_mode(),
+            "persistExtendedHistory": False,
+        }
+        start_params: dict[str, object] = {
+            "cwd": str(self.workspace),
+            "approvalPolicy": self.bot.resolve_approval_policy(),
+            "approvalsReviewer": "user",
+            "sandbox": self.bot.resolve_sandbox_mode(),
+            "serviceName": f"codex-discord-{self.bot.config.bot_role}",
+            "experimentalRawEvents": False,
+            "persistExtendedHistory": False,
+        }
+        if model:
+            resume_params["model"] = model
+            start_params["model"] = model
+
+        record = self.bot.get_thread_session(self.discord_thread_id, self.workspace)
+        if record is not None:
+            try:
+                resume_params["threadId"] = record.session_id
+                response = await self.send_request("thread/resume", resume_params)
+            except Exception:
+                logging.exception("Failed to resume app-server thread for Discord thread %s", self.discord_thread_id)
+                self.bot.session_store.delete(self.discord_thread_id)
+                response = await self.send_request("thread/start", start_params)
+        else:
+            response = await self.send_request("thread/start", start_params)
+
+        thread = response.get("thread")
+        if not isinstance(thread, dict):
+            raise RuntimeError("app-server did not return a thread object")
+        codex_thread_id = thread.get("id")
+        if not isinstance(codex_thread_id, str) or not codex_thread_id:
+            raise RuntimeError("app-server thread response is missing id")
+        self.bot.session_store.set(self.discord_thread_id, codex_thread_id, self.workspace)
+        return codex_thread_id
+
+    async def run_turn(self, prompt: str, source_message: discord.Message) -> dict[str, object]:
+        codex_thread_id = await self.ensure_codex_thread()
+        completion_future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
+        self.pending_turn_state = AppServerTurnState(
+            turn_id="",
+            source_message_id=source_message.id,
+            completion_future=completion_future,
+        )
+        response = await self.send_request(
+            "turn/start",
+            {
+                "threadId": codex_thread_id,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                        "text_elements": [],
+                    }
+                ],
+                "cwd": str(self.workspace),
+            },
+        )
+        turn = response.get("turn")
+        if isinstance(turn, dict):
+            turn_id = turn.get("id")
+            if isinstance(turn_id, str) and self.pending_turn_state is not None:
+                self.pending_turn_state.turn_id = turn_id
+                self.current_turns[turn_id] = self.pending_turn_state
+                self.pending_turn_state = None
+
+        return await asyncio.wait_for(completion_future, timeout=self.bot.config.timeout_seconds)
 
 
 class CodexDiscordBot(commands.Bot):
@@ -512,9 +749,10 @@ class CodexDiscordBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
         self.thread_locks: dict[int, asyncio.Lock] = {}
+        self.session_runtimes: dict[int, ThreadSessionRuntime] = {}
         self.pending_approvals: dict[str, PendingApproval] = {}
         self.last_execution: ExecutionRecord | None = None
-        state_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"{self.config.bot_role}-sessions.json"
+        state_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"{self.config.bot_role}-app-server-threads.json"
         self.session_store = SessionStore(state_path)
 
     async def setup_hook(self) -> None:
@@ -572,8 +810,11 @@ class CodexDiscordBot(commands.Bot):
         prompt = message_to_prompt(message)
         if not prompt:
             return
-        if prompt_requires_destructive_approval(prompt):
-            await self.request_destructive_approval(message, workspace, prompt)
+        if len(prompt) > self.config.max_prompt_chars:
+            await thread.send(
+                f"Prompt is too long ({len(prompt)} chars). "
+                f"Limit: {self.config.max_prompt_chars} chars."
+            )
             return
 
         lock = self.get_thread_lock(thread.id)
@@ -583,8 +824,20 @@ class CodexDiscordBot(commands.Bot):
 
         async with lock:
             async with thread.typing():
-                response_text = await self.run_codex_turn_for_message(thread, workspace, prompt)
-            await self.send_message_output(message, response_text, filename_prefix=f"message-{thread.id}")
+                runtime = self.get_or_create_runtime(thread.id, workspace)
+                started = asyncio.get_running_loop().time()
+                try:
+                    turn = await runtime.run_turn(prompt, message)
+                except Exception as exc:
+                    duration = asyncio.get_running_loop().time() - started
+                    self.record_execution("ask", "failed", workspace, duration, f"runtime error: {exc}")
+                    await thread.send(f"Codex runtime error: {exc}")
+                    return
+                duration = asyncio.get_running_loop().time() - started
+                turn_status = str(turn.get("status", "unknown"))
+                summary = f"turn {turn_status} in {duration:.1f}s"
+                record_status = "success" if turn_status == "completed" else "failed"
+                self.record_execution("ask", record_status, workspace, duration, summary)
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         logging.exception("Unhandled app command error", exc_info=error)
@@ -736,87 +989,186 @@ class CodexDiscordBot(commands.Bot):
         for chunk in chunks[1:]:
             await source_message.channel.send(chunk)
 
-    def build_approval_id(self, thread_id: int, source_message_id: int) -> str:
-        return f"{thread_id}:{source_message_id}"
-
-    async def request_destructive_approval(
-        self,
-        source_message: discord.Message,
-        workspace: Path,
-        prompt: str,
-    ) -> None:
-        approval_id = self.build_approval_id(source_message.channel.id, source_message.id)
-        self.pending_approvals[approval_id] = PendingApproval(
-            thread_id=source_message.channel.id,
-            source_message_id=source_message.id,
-            workspace=workspace.resolve(),
-            prompt=prompt,
-            requested_at=now_utc_iso(),
-        )
-        view = ApprovalView(self, approval_id)
-        await source_message.reply(
-            "This request looks destructive. Click `Approve` to send it to Codex or `Deny` to cancel.",
-            view=view,
-            mention_author=False,
-        )
+    def build_approval_id(self, thread_id: int, request_id: int | str) -> str:
+        return f"{thread_id}:{request_id}"
 
     def disable_view_buttons(self, view: discord.ui.View) -> None:
         for item in view.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = True
 
-    async def handle_approval_click(
+    def get_or_create_runtime(self, thread_id: int, workspace: Path) -> ThreadSessionRuntime:
+        runtime = self.session_runtimes.get(thread_id)
+        resolved_workspace = workspace.resolve()
+        if runtime is not None and runtime.workspace == resolved_workspace:
+            return runtime
+        runtime = ThreadSessionRuntime(self, thread_id, resolved_workspace)
+        self.session_runtimes[thread_id] = runtime
+        return runtime
+
+    def extract_arg_value(self, args: list[str], names: tuple[str, ...]) -> str | None:
+        for index, arg in enumerate(args):
+            if arg in names and index + 1 < len(args):
+                return args[index + 1]
+            for name in names:
+                prefix = f"{name}="
+                if arg.startswith(prefix):
+                    return arg[len(prefix) :]
+        return None
+
+    def resolve_codex_model(self) -> str | None:
+        return self.extract_arg_value(self.config.codex_exec_args, ("--model", "-m"))
+
+    def resolve_approval_policy(self) -> object:
+        return self.extract_arg_value(self.config.codex_global_args, ("--ask-for-approval", "-a")) or "on-request"
+
+    def resolve_sandbox_mode(self) -> str:
+        if "--dangerously-bypass-approvals-and-sandbox" in self.config.codex_global_args:
+            return "danger-full-access"
+        if "--full-auto" in self.config.codex_global_args:
+            return "workspace-write"
+        sandbox = self.extract_arg_value(
+            self.config.codex_global_args + self.config.codex_exec_args,
+            ("--sandbox", "-s"),
+        )
+        return sandbox or "workspace-write"
+
+    async def post_agent_message(
+        self,
+        thread_id: int,
+        source_message_id: int,
+        text: str,
+        reply_to_source: bool,
+    ) -> None:
+        channel = self.get_channel(thread_id)
+        if not isinstance(channel, discord.Thread):
+            fetched = await self.fetch_channel(thread_id)
+            channel = fetched if isinstance(fetched, discord.Thread) else None
+        if not isinstance(channel, discord.Thread):
+            logging.warning("Discord thread not found for runtime thread_id=%s", thread_id)
+            return
+
+        if reply_to_source:
+            try:
+                source_message = await channel.fetch_message(source_message_id)
+                await self.send_message_output(source_message, text, filename_prefix=f"message-{thread_id}")
+                return
+            except discord.HTTPException:
+                pass
+
+        if len(text) > DISCORD_FILE_FALLBACK_LIMIT:
+            filename = f"message-{thread_id}.txt"
+            file_data = io.BytesIO(text.encode("utf-8", errors="replace"))
+            file = discord.File(file_data, filename=filename)
+            await channel.send(f"Output was too long, attached as `{filename}`.", file=file)
+            return
+
+        chunks = chunk_text(text)
+        await channel.send(chunks[0])
+        for chunk in chunks[1:]:
+            await channel.send(chunk)
+
+    def format_app_server_approval_message(self, method: str, params: dict[str, object]) -> str:
+        reason = params.get("reason")
+        reason_line = f"reason: {reason}" if isinstance(reason, str) and reason.strip() else "reason: (none)"
+
+        if method == "item/commandExecution/requestApproval":
+            command = params.get("command")
+            cwd = params.get("cwd")
+            lines = ["Codex wants to run a command.", reason_line]
+            if isinstance(command, str) and command.strip():
+                lines.append(f"command: `{command}`")
+            if isinstance(cwd, str) and cwd.strip():
+                lines.append(f"cwd: `{cwd}`")
+            return "\n".join(lines)
+
+        if method == "item/fileChange/requestApproval":
+            grant_root = params.get("grantRoot")
+            lines = ["Codex wants to apply file changes.", reason_line]
+            if isinstance(grant_root, str) and grant_root.strip():
+                lines.append(f"grant root: `{grant_root}`")
+            return "\n".join(lines)
+
+        if method == "item/permissions/requestApproval":
+            permissions = params.get("permissions")
+            return "Codex requested additional permissions.\n" + reason_line + f"\npermissions: `{json.dumps(permissions, ensure_ascii=False)}`"
+
+        if method == "execCommandApproval":
+            command = params.get("command")
+            return "Codex wants to run a command.\n" + reason_line + f"\ncommand: `{command}`"
+
+        if method == "applyPatchApproval":
+            return "Codex wants to apply a patch.\n" + reason_line
+
+        return f"Codex requested approval for `{method}`.\n{reason_line}"
+
+    async def handle_app_server_request(
+        self,
+        runtime: ThreadSessionRuntime,
+        request_id: int | str,
+        method: str,
+        params: dict[str, object],
+    ) -> None:
+        approval_id = self.build_approval_id(runtime.discord_thread_id, request_id)
+        self.pending_approvals[approval_id] = PendingApproval(
+            runtime=runtime,
+            request_id=request_id,
+            method=method,
+            params=params,
+            requested_at=now_utc_iso(),
+        )
+
+        channel = self.get_channel(runtime.discord_thread_id)
+        if not isinstance(channel, discord.Thread):
+            fetched = await self.fetch_channel(runtime.discord_thread_id)
+            channel = fetched if isinstance(fetched, discord.Thread) else None
+        if not isinstance(channel, discord.Thread):
+            logging.warning("Unable to find Discord thread for approval request %s", approval_id)
+            return
+
+        view = AppServerApprovalView(self, approval_id)
+        await channel.send(self.format_app_server_approval_message(method, params), view=view)
+
+    async def handle_app_server_approval_click(
         self,
         interaction: discord.Interaction,
         approval_id: str,
         approved: bool,
-        view: ApprovalView,
+        view: AppServerApprovalView,
     ) -> None:
-        pending = self.pending_approvals.get(approval_id)
+        pending = self.pending_approvals.pop(approval_id, None)
         if pending is None:
             self.disable_view_buttons(view)
-            await interaction.response.edit_message(
-                content="This approval request is no longer available.",
-                view=view,
-            )
+            await interaction.response.edit_message(content="This approval request is no longer available.", view=view)
             return
 
-        self.pending_approvals.pop(approval_id, None)
         self.disable_view_buttons(view)
-
-        if not approved:
-            await interaction.response.edit_message(content="Request denied.", view=view)
-            return
-
-        channel = self.get_channel(pending.thread_id)
-        if not isinstance(channel, discord.Thread):
-            maybe_channel = await self.fetch_channel(pending.thread_id)
-            channel = maybe_channel if isinstance(maybe_channel, discord.Thread) else None
-        if not isinstance(channel, discord.Thread):
-            await interaction.response.edit_message(content="Thread no longer exists. Approval canceled.", view=view)
-            return
+        response_payload: dict[str, object]
+        if pending.method == "item/commandExecution/requestApproval":
+            response_payload = {"decision": "accept" if approved else "cancel"}
+        elif pending.method == "item/fileChange/requestApproval":
+            response_payload = {"decision": "accept" if approved else "cancel"}
+        elif pending.method == "item/permissions/requestApproval":
+            if approved:
+                response_payload = {"permissions": pending.params.get("permissions", {}), "scope": "turn"}
+            else:
+                response_payload = {"permissions": {}, "scope": "turn"}
+        elif pending.method in {"execCommandApproval", "applyPatchApproval"}:
+            response_payload = {"decision": "approved" if approved else "abort"}
+        else:
+            response_payload = {"decision": "accept" if approved else "cancel"}
 
         try:
-            source_message = await channel.fetch_message(pending.source_message_id)
-        except discord.HTTPException:
-            await interaction.response.edit_message(content="Original message not found. Approval canceled.", view=view)
+            await pending.runtime.send_response(pending.request_id, response_payload)
+        except Exception as exc:
+            logging.exception("Failed to send approval response")
+            await interaction.response.edit_message(content=f"Failed to send approval response: {exc}", view=view)
             return
 
-        lock = self.get_thread_lock(channel.id)
-        if lock.locked():
-            await interaction.response.send_message(
-                "A Codex task is already running in this thread. Wait for it to finish.",
-                ephemeral=True,
-            )
-            return
+        status_text = "Approved." if approved else "Denied."
+        await interaction.response.edit_message(content=status_text, view=view)
 
-        await interaction.response.edit_message(content="Approved. Sending request to Codex...", view=view)
-        async with lock:
-            async with channel.typing():
-                response_text = await self.run_codex_turn_for_message(channel, pending.workspace, pending.prompt)
-            await self.send_message_output(source_message, response_text, filename_prefix=f"message-{channel.id}")
-
-    async def run_process(self, args: list[str], cwd: Path, timeout_seconds: int | None = None) -> ProcessResult:
+    async def run_process(self, args: list[str], cwd: Path, timeout_seconds: int | None = None) -> "ProcessResult":
         timeout = timeout_seconds or self.config.timeout_seconds
         start = asyncio.get_running_loop().time()
         process = await asyncio.create_subprocess_exec(
@@ -858,177 +1210,6 @@ class CodexDiscordBot(commands.Bot):
             self.session_store.delete(thread_id)
             return None
         return record
-
-    def build_codex_exec_args(self, workspace: Path, prompt: str) -> list[str]:
-        return [
-            self.config.codex_bin,
-            *self.config.codex_global_args,
-            "exec",
-            "--json",
-            "-C",
-            str(workspace),
-            *self.config.codex_exec_args,
-            prompt,
-        ]
-
-    def build_codex_resume_args(self, session_id: str, prompt: str) -> list[str]:
-        return [
-            self.config.codex_bin,
-            *self.config.codex_global_args,
-            "exec",
-            "resume",
-            "--json",
-            *strip_resume_unsupported_args(self.config.codex_exec_args),
-            session_id,
-            prompt,
-        ]
-
-    def parse_codex_json_output(self, stdout_text: str) -> tuple[str | None, list[str], list[str], list[str]]:
-        session_id: str | None = None
-        agent_messages: list[str] = []
-        file_changes: list[str] = []
-        raw_lines: list[str] = []
-
-        for line in stdout_text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                event = json.loads(stripped)
-            except json.JSONDecodeError:
-                raw_lines.append(stripped)
-                continue
-
-            if not isinstance(event, dict):
-                continue
-
-            event_type = event.get("type")
-            if event_type == "thread.started":
-                maybe_session_id = event.get("thread_id")
-                if isinstance(maybe_session_id, str) and maybe_session_id:
-                    session_id = maybe_session_id
-                continue
-
-            if event_type != "item.completed":
-                continue
-
-            item = event.get("item")
-            if not isinstance(item, dict):
-                continue
-
-            item_type = item.get("type")
-            if item_type == "agent_message":
-                text = item.get("text")
-                if isinstance(text, str) and text.strip():
-                    agent_messages.append(text.strip())
-                continue
-
-            if item_type == "file_change":
-                changes = item.get("changes")
-                if not isinstance(changes, list):
-                    continue
-                for change in changes:
-                    if not isinstance(change, dict):
-                        continue
-                    path = change.get("path")
-                    kind = change.get("kind")
-                    if isinstance(path, str) and path:
-                        if isinstance(kind, str) and kind:
-                            file_changes.append(f"{kind}: {path}")
-                        else:
-                            file_changes.append(path)
-
-        return session_id, agent_messages, file_changes, raw_lines
-
-    async def run_codex_turn(self, workspace: Path, prompt: str, session_id: str | None) -> CodexTurnResult:
-        args = (
-            self.build_codex_resume_args(session_id, prompt)
-            if session_id
-            else self.build_codex_exec_args(workspace, prompt)
-        )
-        result = await self.run_process(args=args, cwd=workspace)
-        parsed_session_id, messages, file_changes, raw_lines = self.parse_codex_json_output(result.stdout)
-        effective_session_id = parsed_session_id or session_id
-        if raw_lines:
-            logging.warning("Non-JSON codex output workspace=%s lines=%s", workspace, raw_lines)
-        if result.stderr:
-            logging.warning(
-                "codex exec stderr workspace=%s returncode=%s stderr=%s",
-                workspace,
-                result.returncode,
-                result.stderr,
-            )
-
-        return CodexTurnResult(
-            session_id=effective_session_id,
-            messages=messages,
-            file_changes=file_changes,
-            returncode=result.returncode,
-            stderr=result.stderr,
-            duration_seconds=result.duration_seconds,
-            timed_out=result.timed_out,
-        )
-
-    async def run_codex_turn_for_message(self, thread: discord.Thread, workspace: Path, prompt: str) -> str:
-        record = self.get_thread_session(thread.id, workspace)
-        prior_session_id = record.session_id if record else None
-
-        try:
-            result = await self.run_codex_turn(workspace, prompt, prior_session_id)
-        except FileNotFoundError:
-            summary = f"missing executable: {self.config.codex_bin}"
-            self.record_execution("ask", "failed", workspace, 0.0, summary)
-            return f"Unable to start `{self.config.codex_bin}`. Check that Codex CLI is installed and on PATH."
-        except Exception as exc:
-            logging.exception("Unexpected error while running codex exec")
-            summary = f"unexpected error: {exc}"
-            self.record_execution("ask", "failed", workspace, 0.0, summary)
-            return f"Unexpected error while running codex exec: {exc}"
-
-        if result.session_id:
-            self.session_store.set(thread.id, result.session_id, workspace)
-
-        if result.timed_out:
-            self.record_execution(
-                "ask",
-                "failed",
-                workspace,
-                result.duration_seconds,
-                f"timed out after {self.config.timeout_seconds}s",
-            )
-            return f"codex exec timed out after {self.config.timeout_seconds} seconds."
-
-        if result.returncode != 0:
-            self.record_execution(
-                "ask",
-                "failed",
-                workspace,
-                result.duration_seconds,
-                f"exit code {result.returncode}",
-            )
-            lines = [f"codex exec failed with exit code {result.returncode}."]
-            if result.stderr:
-                lines.append("")
-                lines.append(f"stderr:\n{result.stderr}")
-            return "\n".join(lines)
-
-        response_sections: list[str] = []
-        if result.messages:
-            response_sections.append("\n\n".join(result.messages))
-
-        file_change_summary = summarize_file_changes(result.file_changes)
-        if file_change_summary:
-            response_sections.append(file_change_summary)
-
-        if result.session_id:
-            summary = f"success in {result.duration_seconds:.1f}s session={result.session_id}"
-        else:
-            summary = f"success in {result.duration_seconds:.1f}s"
-        self.record_execution("ask", "success", workspace, result.duration_seconds, summary)
-
-        if response_sections:
-            return "\n\n".join(response_sections)
-        return "codex exec finished without output."
 
     async def get_git_summary(self, target_path: Path) -> str:
         inside_repo = await self.run_process(

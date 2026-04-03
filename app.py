@@ -44,6 +44,7 @@ class AppConfig:
     max_prompt_chars: int
     codex_bin: str
     codex_exec_args: list[str]
+    restart_args: list[str]
     restart_staging_args: list[str]
     deploy_args: list[str]
 
@@ -298,6 +299,11 @@ def load_app_config() -> AppConfig:
         main_commands.get("restart_staging"),
         default=["./scripts/systemd-restart-service.sh", "codex-discord-staging"],
     )
+    restart_args = parse_command_args(
+        "main_commands.restart",
+        main_commands.get("restart"),
+        default=["./scripts/systemd-restart-service.sh", "codex-discord-main"],
+    )
     deploy_args = parse_command_args(
         "main_commands.deploy",
         main_commands.get("deploy"),
@@ -323,6 +329,7 @@ def load_app_config() -> AppConfig:
         max_prompt_chars=max_prompt_chars,
         codex_bin=codex_bin,
         codex_exec_args=codex_exec_args,
+        restart_args=restart_args,
         restart_staging_args=restart_staging_args,
         deploy_args=deploy_args,
     )
@@ -349,6 +356,7 @@ class CodexDiscordBot(commands.Bot):
         new_session_command.name = command_name_for_role("new-session", self.config.bot_role)
         status_command.name = command_name_for_role("status", self.config.bot_role)
         diff_command.name = command_name_for_role("diff", self.config.bot_role)
+        restart_command.name = "restart"
         restart_staging_command.name = "restart-staging"
         deploy_command.name = "deploy"
 
@@ -358,6 +366,7 @@ class CodexDiscordBot(commands.Bot):
         self.tree.add_command(diff_command, guild=guild)
 
         if self.config.bot_role == "main":
+            self.tree.add_command(restart_command, guild=guild)
             self.tree.add_command(restart_staging_command, guild=guild)
             self.tree.add_command(deploy_command, guild=guild)
 
@@ -500,6 +509,17 @@ class CodexDiscordBot(commands.Bot):
     async def ensure_thread_only(self, interaction: discord.Interaction, command_name: str) -> bool:
         if not isinstance(interaction.channel, discord.Thread):
             message = f"`/{command_name}` can only be used inside a thread."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return False
+        return True
+
+    async def ensure_session_context(self, interaction: discord.Interaction, command_name: str) -> bool:
+        parent_channel, workspace = self.resolve_session_parent_channel(interaction)
+        if parent_channel is None or workspace is None:
+            message = f"`/{command_name}` must be used in a mapped parent channel or one of its threads."
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
             else:
@@ -857,6 +877,21 @@ class CodexDiscordBot(commands.Bot):
             lines.append("(no output)")
         return "\n".join(lines)
 
+    async def spawn_main_operation(self, command_name: str, args: list[str]) -> None:
+        await asyncio.sleep(1)
+        try:
+            await asyncio.create_subprocess_exec(
+                *args,
+                cwd=str(self.config.checkout_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            logging.exception("Failed to start %s: missing executable %s", command_name, args[0])
+        except Exception:
+            logging.exception("Unexpected error while starting %s", command_name)
+
     async def handle_ping(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
@@ -947,7 +982,7 @@ class CodexDiscordBot(commands.Bot):
         if self.config.bot_role != "main":
             await interaction.response.send_message("`/restart-staging` is only available on the main bot.", ephemeral=True)
             return
-        if not await self.ensure_thread_only(interaction, "restart-staging"):
+        if not await self.ensure_session_context(interaction, "restart-staging"):
             return
         if not await self.ensure_thread_owned(interaction):
             return
@@ -956,13 +991,30 @@ class CodexDiscordBot(commands.Bot):
         result_text = await self.run_main_operation("restart_staging", self.config.restart_staging_args)
         await self.send_output(interaction, result_text, filename_prefix="restart-staging")
 
+    async def handle_restart(self, interaction: discord.Interaction) -> None:
+        if not await self.ensure_allowed_or_reply(interaction):
+            return
+        if self.config.bot_role != "main":
+            await interaction.response.send_message("`/restart` is only available on the main bot.", ephemeral=True)
+            return
+        if not await self.ensure_session_context(interaction, "restart"):
+            return
+        if not await self.ensure_thread_owned(interaction):
+            return
+
+        self.record_execution("restart", "requested", self.config.checkout_path, 0.0, "restart requested")
+        await interaction.response.send_message(
+            f"Restart requested.\ncommand: {' '.join(self.config.restart_args)}"
+        )
+        asyncio.create_task(self.spawn_main_operation("restart", self.config.restart_args))
+
     async def handle_deploy(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
         if self.config.bot_role != "main":
             await interaction.response.send_message("`/deploy` is only available on the main bot.", ephemeral=True)
             return
-        if not await self.ensure_thread_only(interaction, "deploy"):
+        if not await self.ensure_session_context(interaction, "deploy"):
             return
         if not await self.ensure_thread_owned(interaction):
             return
@@ -1014,13 +1066,19 @@ async def diff_command(interaction: discord.Interaction) -> None:
     await bot.handle_diff(interaction)
 
 
-@app_commands.command(name="restart-staging", description="Restart the staging bot service. Main bot only. Thread only.")
+@app_commands.command(name="restart", description="Restart the main bot service. Main bot only. Channel or thread.")
+async def restart_command(interaction: discord.Interaction) -> None:
+    bot = get_bot_from_interaction(interaction)
+    await bot.handle_restart(interaction)
+
+
+@app_commands.command(name="restart-staging", description="Restart the staging bot service. Main bot only. Channel or thread.")
 async def restart_staging_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_restart_staging(interaction)
 
 
-@app_commands.command(name="deploy", description="Run the configured deploy script. Main bot only. Thread only.")
+@app_commands.command(name="deploy", description="Run the configured deploy script. Main bot only. Channel or thread.")
 async def deploy_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_deploy(interaction)

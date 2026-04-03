@@ -15,6 +15,10 @@
     "never"
   ],
   "main_commands": {
+    "restart": [
+      "./scripts/systemd-restart-service.sh",
+      "codex-discord-main"
+    ],
     "restart_staging": [
       "./scripts/systemd-restart-service.sh",
       "codex-discord-staging"

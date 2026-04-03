@@ -501,6 +501,9 @@ class AppServerTurnState:
     source_message_id: int
     completion_future: asyncio.Future[dict[str, object]]
     agent_messages_sent: int = 0
+    started_at: str = field(default_factory=now_utc_iso)
+    last_event_at: str = field(default_factory=now_utc_iso)
+    last_event: str = "turn created"
 
 
 class AppServerApprovalView(discord.ui.View):
@@ -598,6 +601,30 @@ class ThreadSessionRuntime:
         self.started = False
         self.start_lock = asyncio.Lock()
         self.write_lock = asyncio.Lock()
+
+    def get_active_turn_state(self) -> AppServerTurnState | None:
+        if self.pending_turn_state is not None:
+            return self.pending_turn_state
+        if not self.current_turns:
+            return None
+        return max(self.current_turns.values(), key=lambda state: state.last_event_at)
+
+    def note_turn_event(self, event: str, *, turn_id: str | None = None) -> None:
+        state: AppServerTurnState | None = None
+        if turn_id is not None:
+            state = self.current_turns.get(turn_id)
+        if state is None:
+            state = self.get_active_turn_state()
+        if state is None:
+            return
+        state.last_event = event
+        state.last_event_at = now_utc_iso()
+
+    def get_active_turn_id(self) -> str | None:
+        state = self.get_active_turn_state()
+        if state is None or not state.turn_id:
+            return None
+        return state.turn_id
 
     async def ensure_started(self) -> None:
         if self.process is not None and self.process.returncode is None and self.started:
@@ -721,8 +748,11 @@ class ThreadSessionRuntime:
                 turn_id = turn.get("id")
                 if isinstance(turn_id, str) and self.pending_turn_state is not None:
                     self.pending_turn_state.turn_id = turn_id
+                    self.pending_turn_state.last_event = "turn/started received"
+                    self.pending_turn_state.last_event_at = now_utc_iso()
                     self.current_turns[turn_id] = self.pending_turn_state
                     self.pending_turn_state = None
+                    logging.info("app-server turn started thread=%s turn=%s", self.discord_thread_id, turn_id)
             return
 
         if method == "item/completed":
@@ -735,9 +765,16 @@ class ThreadSessionRuntime:
                 return
 
             item_type = item.get("type")
+            self.note_turn_event(f"item/completed:{item_type}", turn_id=turn_id)
             if item_type == "agentMessage":
                 text = item.get("text")
                 if isinstance(text, str) and text.strip():
+                    logging.info(
+                        "app-server agent message thread=%s turn=%s chars=%s",
+                        self.discord_thread_id,
+                        turn_id,
+                        len(text.strip()),
+                    )
                     await self.bot.post_agent_message(
                         self.discord_thread_id,
                         turn_state.source_message_id,
@@ -757,11 +794,19 @@ class ThreadSessionRuntime:
             turn_state = self.current_turns.pop(turn_id, None)
             if turn_state is None:
                 return
+            turn_state.last_event = "turn/completed received"
+            turn_state.last_event_at = now_utc_iso()
             if not turn_state.completion_future.done():
                 turn_state.completion_future.set_result(turn)
 
             status = turn.get("status")
             error = turn.get("error")
+            logging.info(
+                "app-server turn completed thread=%s turn=%s status=%s",
+                self.discord_thread_id,
+                turn_id,
+                status,
+            )
             if turn_state.agent_messages_sent == 0:
                 if status == "failed" and isinstance(error, dict):
                     message = error.get("message")
@@ -856,6 +901,13 @@ class ThreadSessionRuntime:
             turn_id="",
             source_message_id=source_message.id,
             completion_future=completion_future,
+            last_event="turn/start requested",
+        )
+        logging.info(
+            "starting turn thread=%s source_message=%s session=%s",
+            self.discord_thread_id,
+            source_message.id,
+            codex_thread_id,
         )
         response = await self.send_request(
             "turn/start",
@@ -876,10 +928,33 @@ class ThreadSessionRuntime:
             turn_id = turn.get("id")
             if isinstance(turn_id, str) and self.pending_turn_state is not None:
                 self.pending_turn_state.turn_id = turn_id
+                self.pending_turn_state.last_event = "turn/start response received"
+                self.pending_turn_state.last_event_at = now_utc_iso()
                 self.current_turns[turn_id] = self.pending_turn_state
                 self.pending_turn_state = None
+                logging.info("turn/start response thread=%s turn=%s", self.discord_thread_id, turn_id)
 
         return await asyncio.wait_for(completion_future, timeout=self.bot.config.timeout_seconds)
+
+    async def interrupt_active_turn(self) -> tuple[bool, str]:
+        record = self.bot.get_thread_session(self.discord_thread_id, self.workspace)
+        if record is None:
+            return False, "현재 스레드에 연결된 Codex 세션이 없어요."
+
+        turn_id = self.get_active_turn_id()
+        if turn_id is None:
+            return False, "중단할 활성 turn이 없어요."
+
+        self.note_turn_event("turn/interrupt requested", turn_id=turn_id)
+        await self.send_request(
+            "turn/interrupt",
+            {
+                "threadId": record.session_id,
+                "turnId": turn_id,
+            },
+        )
+        logging.warning("turn interrupt requested thread=%s turn=%s", self.discord_thread_id, turn_id)
+        return True, f"현재 작업 중인 turn `{turn_id}`에 중단 요청을 보냈어요."
 
 
 class CodexDiscordBot(commands.Bot):
@@ -1020,6 +1095,7 @@ class CodexDiscordBot(commands.Bot):
         delete_repo_command.name = command_name_for_role("delete-repo", self.config.bot_role)
         status_command.name = command_name_for_role("status", self.config.bot_role)
         diff_command.name = command_name_for_role("diff", self.config.bot_role)
+        break_command.name = command_name_for_role("break", self.config.bot_role)
         restart_command.name = "restart"
         restart_staging_command.name = "restart-staging"
         deploy_command.name = "deploy"
@@ -1030,6 +1106,7 @@ class CodexDiscordBot(commands.Bot):
         self.tree.add_command(delete_repo_command, guild=guild)
         self.tree.add_command(status_command, guild=guild)
         self.tree.add_command(diff_command, guild=guild)
+        self.tree.add_command(break_command, guild=guild)
 
         if self.config.bot_role == "main":
             self.tree.add_command(restart_command, guild=guild)
@@ -1098,6 +1175,30 @@ class CodexDiscordBot(commands.Bot):
                 started = asyncio.get_running_loop().time()
                 try:
                     turn = await runtime.run_turn(prompt, message)
+                except asyncio.TimeoutError:
+                    duration = asyncio.get_running_loop().time() - started
+                    pending_approvals = self.get_pending_approvals_for_thread(thread.id)
+                    runtime_state = self.describe_runtime_state(thread.id)
+                    self.record_execution("ask", "failed", workspace, duration, "turn timeout")
+                    logging.error(
+                        "turn timed out thread=%s source_message=%s approvals=%s runtime_state=%s",
+                        thread.id,
+                        message.id,
+                        len(pending_approvals),
+                        runtime_state,
+                    )
+                    await self.send_channel_embed(
+                        thread,
+                        title="Codex 응답 시간 초과",
+                        description=(
+                            f"{self.config.timeout_seconds}초 안에 turn이 끝나지 않았어요.\n"
+                            f"대기 중인 승인 수: `{len(pending_approvals)}`\n"
+                            f"런타임 상태: `{runtime_state}`\n"
+                            f"`/{command_name_for_role('status', self.config.bot_role)}`로 상세 상태를 확인해 보세요."
+                        ),
+                        tone="warning",
+                    )
+                    return
                 except Exception as exc:
                     duration = asyncio.get_running_loop().time() - started
                     self.record_execution("ask", "failed", workspace, duration, f"런타임 오류: {exc}")
@@ -1382,6 +1483,56 @@ class CodexDiscordBot(commands.Bot):
         self.session_runtimes[thread_id] = runtime
         return runtime
 
+    def get_pending_approvals_for_thread(self, thread_id: int) -> list[PendingApproval]:
+        return [
+            pending
+            for pending in self.pending_approvals.values()
+            if pending.runtime.discord_thread_id == thread_id
+        ]
+
+    def describe_runtime_state(self, thread_id: int) -> str:
+        runtime = self.session_runtimes.get(thread_id)
+        if runtime is None:
+            return "런타임 없음"
+
+        state = runtime.get_active_turn_state()
+        if state is None:
+            return "활성 turn 없음"
+
+        turn_id = state.turn_id or "(미할당)"
+        return (
+            f"turn={turn_id}, last_event={state.last_event}, last_event_at={state.last_event_at}, "
+            f"agent_messages_sent={state.agent_messages_sent}"
+        )
+
+    def build_approval_response_payload(
+        self,
+        method: str,
+        params: dict[str, object],
+        approved: bool,
+    ) -> dict[str, object]:
+        if method == "item/commandExecution/requestApproval":
+            return {"decision": "accept" if approved else "cancel"}
+        if method == "item/fileChange/requestApproval":
+            return {"decision": "accept" if approved else "cancel"}
+        if method == "item/permissions/requestApproval":
+            if approved:
+                return {"permissions": params.get("permissions", {}), "scope": "turn"}
+            return {"permissions": {}, "scope": "turn"}
+        if method in {"execCommandApproval", "applyPatchApproval"}:
+            return {"decision": "approved" if approved else "abort"}
+        return {"decision": "accept" if approved else "cancel"}
+
+    def clear_pending_approvals_for_thread(self, thread_id: int) -> int:
+        approval_ids = [
+            approval_id
+            for approval_id, pending in self.pending_approvals.items()
+            if pending.runtime.discord_thread_id == thread_id
+        ]
+        for approval_id in approval_ids:
+            self.pending_approvals.pop(approval_id, None)
+        return len(approval_ids)
+
     def extract_arg_value(self, args: list[str], names: tuple[str, ...]) -> str | None:
         for index, arg in enumerate(args):
             if arg in names and index + 1 < len(args):
@@ -1503,6 +1654,13 @@ class CodexDiscordBot(commands.Bot):
             params=params,
             requested_at=now_utc_iso(),
         )
+        runtime.note_turn_event(f"approval requested:{method}")
+        logging.warning(
+            "app-server approval requested thread=%s request=%s method=%s",
+            runtime.discord_thread_id,
+            request_id,
+            method,
+        )
 
         channel = self.get_channel(runtime.discord_thread_id)
         if not isinstance(channel, discord.Thread):
@@ -1510,11 +1668,28 @@ class CodexDiscordBot(commands.Bot):
             channel = fetched if isinstance(fetched, discord.Thread) else None
         if not isinstance(channel, discord.Thread):
             logging.warning("Unable to find Discord thread for approval request %s", approval_id)
+            self.pending_approvals.pop(approval_id, None)
+            await runtime.send_response(
+                request_id,
+                self.build_approval_response_payload(method, params, approved=False),
+            )
             return
 
         view = AppServerApprovalView(self, approval_id)
         title, description = self.format_app_server_approval_message(method, params)
-        await self.send_channel_embed(channel, title=title, description=description, tone="warning", view=view)
+        try:
+            await self.send_channel_embed(channel, title=title, description=description, tone="warning", view=view)
+        except discord.HTTPException:
+            logging.exception(
+                "Failed to send approval request message thread=%s request=%s",
+                runtime.discord_thread_id,
+                request_id,
+            )
+            self.pending_approvals.pop(approval_id, None)
+            await runtime.send_response(
+                request_id,
+                self.build_approval_response_payload(method, params, approved=False),
+            )
 
     async def handle_app_server_approval_click(
         self,
@@ -1531,20 +1706,7 @@ class CodexDiscordBot(commands.Bot):
             return
 
         self.disable_view_buttons(view)
-        response_payload: dict[str, object]
-        if pending.method == "item/commandExecution/requestApproval":
-            response_payload = {"decision": "accept" if approved else "cancel"}
-        elif pending.method == "item/fileChange/requestApproval":
-            response_payload = {"decision": "accept" if approved else "cancel"}
-        elif pending.method == "item/permissions/requestApproval":
-            if approved:
-                response_payload = {"permissions": pending.params.get("permissions", {}), "scope": "turn"}
-            else:
-                response_payload = {"permissions": {}, "scope": "turn"}
-        elif pending.method in {"execCommandApproval", "applyPatchApproval"}:
-            response_payload = {"decision": "approved" if approved else "abort"}
-        else:
-            response_payload = {"decision": "accept" if approved else "cancel"}
+        response_payload = self.build_approval_response_payload(pending.method, pending.params, approved)
 
         try:
             await pending.runtime.send_response(pending.request_id, response_payload)
@@ -1705,6 +1867,10 @@ class CodexDiscordBot(commands.Bot):
             lines.append(f"세션 갱신 시각: {thread_session.updated_at}")
         else:
             lines.append("세션 ID: 없음")
+        if thread is not None:
+            pending_approvals = self.get_pending_approvals_for_thread(thread.id)
+            lines.append(f"이 스레드 대기 승인 수: {len(pending_approvals)}")
+            lines.append(f"이 스레드 런타임: {self.describe_runtime_state(thread.id)}")
 
         if self.last_execution is None:
             lines.append("최근 실행 기록: 없음")
@@ -1764,7 +1930,9 @@ class CodexDiscordBot(commands.Bot):
                 f"스레드 작업 중: {'예' if current_thread_busy else '아니요'}\n"
                 f"활성 스레드 수: {self.active_thread_count()}\n"
                 f"워크스페이스: {workspace or '연결 없음'}\n"
-                f"세션 ID: {thread_session.session_id if thread_session else '없음'}"
+                f"세션 ID: {thread_session.session_id if thread_session else '없음'}\n"
+                f"대기 승인 수: {len(self.get_pending_approvals_for_thread(thread.id)) if thread is not None else 0}\n"
+                f"런타임: {self.describe_runtime_state(thread.id) if thread is not None else '런타임 없음'}"
             ),
             inline=False,
         )
@@ -2510,6 +2678,75 @@ class CodexDiscordBot(commands.Bot):
         await interaction.response.defer(thinking=True)
         await self.send_diff_embed(interaction, target_path)
 
+    async def handle_break(self, interaction: discord.Interaction) -> None:
+        if not await self.ensure_allowed_or_reply(interaction):
+            return
+        if not await self.ensure_thread_only(interaction, command_name_for_role("break", self.config.bot_role)):
+            return
+        if not await self.ensure_thread_owned(interaction):
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.Thread):
+            await self.send_interaction_embed(
+                interaction,
+                title="스레드에서만 사용 가능",
+                description=f"`/{command_name_for_role('break', self.config.bot_role)}` 명령은 세션 스레드 안에서만 사용할 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        thread, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
+        if thread is None or workspace is None:
+            await self.send_interaction_embed(
+                interaction,
+                title="워크스페이스 연결 필요",
+                description="이 스레드는 워크스페이스에 연결되어 있지 않아요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        runtime = self.get_or_create_runtime(thread.id, workspace)
+        try:
+            interrupted, detail = await runtime.interrupt_active_turn()
+        except Exception as exc:
+            logging.exception("Failed to interrupt active turn thread=%s", thread.id)
+            await self.send_interaction_embed(
+                interaction,
+                title="중단 요청 실패",
+                description=f"현재 작업을 중단하지 못했어요.\n`{exc}`",
+                tone="error",
+                ephemeral=True,
+            )
+            return
+
+        if not interrupted:
+            await self.send_interaction_embed(
+                interaction,
+                title="중단할 작업 없음",
+                description=detail,
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        cleared = self.clear_pending_approvals_for_thread(thread.id)
+        self.record_execution("break", "success", workspace, 0.0, detail)
+        await self.send_interaction_embed(
+            interaction,
+            title="중단 요청 전송",
+            description=(
+                f"{detail}\n"
+                f"정리한 승인 요청 수: `{cleared}`\n"
+                f"잠시 뒤 turn 상태가 `interrupted`로 바뀌면 정상입니다."
+            ),
+            tone="success",
+            ephemeral=True,
+        )
+
     async def handle_restart_staging(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
@@ -2640,6 +2877,12 @@ async def status_command(interaction: discord.Interaction) -> None:
 async def diff_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_diff(interaction)
+
+
+@app_commands.command(name="break", description="현재 스레드에서 실행 중인 Codex 작업을 강제 중단합니다. 스레드 전용.")
+async def break_command(interaction: discord.Interaction) -> None:
+    bot = get_bot_from_interaction(interaction)
+    await bot.handle_break(interaction)
 
 
 @app_commands.command(name="restart", description="main 봇 서비스를 재시작합니다. main 봇 전용. 채널/스레드 사용 가능.")

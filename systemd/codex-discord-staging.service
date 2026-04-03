@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Discord Staging Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/srv/codex-discord/dev
+EnvironmentFile=/srv/codex-discord/dev/.env
+ExecStart=/srv/codex-discord/dev/.venv/bin/python /srv/codex-discord/dev/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

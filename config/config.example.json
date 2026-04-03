@@ -1,0 +1,27 @@
+{
+  "channels": {
+    "111111111111111111": "/srv/codex-discord/dev",
+    "222222222222222222": "/srv/codex-discord/dev/subproject"
+  },
+  "timeout_seconds": 900,
+  "history_messages": 20,
+  "max_prompt_chars": 12000,
+  "codex_bin": "codex",
+  "codex_exec_args": [
+    "--model",
+    "gpt-5.4",
+    "--skip-git-repo-check",
+    "--color",
+    "never"
+  ],
+  "main_commands": {
+    "restart_staging": [
+      "/usr/bin/systemctl",
+      "restart",
+      "codex-discord-staging"
+    ],
+    "deploy": [
+      "./scripts/deploy-prod.sh"
+    ]
+  }
+}

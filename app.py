@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -231,6 +232,38 @@ def normalize_repo_name(name: str) -> str:
     slug = re.sub(r"[^a-z0-9._-]+", "-", name.strip().lower())
     slug = slug.strip("-.")
     return slug[:90]
+
+
+def normalize_github_clone_url(url: str) -> str | None:
+    candidate = url.strip()
+    if not candidate:
+        return None
+
+    scp_style_match = re.fullmatch(r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", candidate)
+    if scp_style_match is not None:
+        owner, repo = scp_style_match.groups()
+        return f"https://github.com/{owner}/{repo}.git"
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https", "ssh"}:
+        return None
+    if parsed.hostname != "github.com":
+        return None
+
+    path = parsed.path.strip("/")
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return None
+
+    owner = parts[0]
+    repo = parts[1]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+(?:\.git)?", repo):
+        return None
+
+    normalized_repo = repo[:-4] if repo.endswith(".git") else repo
+    return f"https://github.com/{owner}/{normalized_repo}.git"
 
 
 def truncate_text(text: str, limit: int) -> str:
@@ -2680,7 +2713,7 @@ class CodexDiscordBot(commands.Bot):
             tone="success",
         )
 
-    async def handle_new_repo(self, interaction: discord.Interaction, name: str) -> None:
+    async def handle_new_repo(self, interaction: discord.Interaction, name: str, github_url: str | None = None) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
         if not await self.ensure_channel_only(interaction, command_name_for_role("new-repo", self.config.bot_role)):
@@ -2707,6 +2740,22 @@ class CodexDiscordBot(commands.Bot):
                 ephemeral=True,
             )
             return
+
+        normalized_github_url: str | None = None
+        if github_url:
+            normalized_github_url = normalize_github_clone_url(github_url)
+            if normalized_github_url is None:
+                await self.send_interaction_embed(
+                    interaction,
+                    title="GitHub URL 형식 오류",
+                    description=(
+                        "비어 있는 레포를 만들거나, `https://github.com/owner/repo` 또는 "
+                        "`git@github.com:owner/repo.git` 형식의 GitHub 레포 URL을 입력해 주세요."
+                    ),
+                    tone="warning",
+                    ephemeral=True,
+                )
+                return
 
         guild = interaction.guild
         if guild is None:
@@ -2745,17 +2794,36 @@ class CodexDiscordBot(commands.Bot):
 
         created_channel: discord.TextChannel | None = None
         created_repo = False
+        branch_name = "main"
         try:
-            repo_path.mkdir(parents=True, exist_ok=False)
-            created_repo = True
+            if normalized_github_url is None:
+                repo_path.mkdir(parents=True, exist_ok=False)
+                created_repo = True
 
-            init_result = await self.run_process(
-                ["git", "init", "-b", "main", str(repo_path)],
-                cwd=repo_root,
-                timeout_seconds=30,
-            )
-            if init_result.timed_out or init_result.returncode != 0:
-                raise RuntimeError(init_result.stderr or init_result.stdout or "git init failed")
+                init_result = await self.run_process(
+                    ["git", "init", "-b", "main", str(repo_path)],
+                    cwd=repo_root,
+                    timeout_seconds=30,
+                )
+                if init_result.timed_out or init_result.returncode != 0:
+                    raise RuntimeError(init_result.stderr or init_result.stdout or "git init failed")
+            else:
+                clone_result = await self.run_process(
+                    ["git", "clone", normalized_github_url, str(repo_path)],
+                    cwd=repo_root,
+                    timeout_seconds=120,
+                )
+                if clone_result.timed_out or clone_result.returncode != 0:
+                    raise RuntimeError(clone_result.stderr or clone_result.stdout or "git clone failed")
+                created_repo = repo_path.exists()
+
+                branch_result = await self.run_process(
+                    ["git", "-C", str(repo_path), "branch", "--show-current"],
+                    cwd=repo_root,
+                    timeout_seconds=15,
+                )
+                if not branch_result.timed_out and branch_result.returncode == 0 and branch_result.stdout.strip():
+                    branch_name = branch_result.stdout.strip()
 
             created_channel = await guild.create_text_channel(
                 name=repo_name,
@@ -2789,9 +2857,11 @@ class CodexDiscordBot(commands.Bot):
             description=(
                 f"채널: {created_channel.mention}\n"
                 f"레포 경로: `{repo_path}`\n"
-                f"초기 브랜치: `main`\n"
-                f"설정 반영: {', '.join(str(path) for path in updated_paths)}\n"
-                "이미 실행 중인 다른 봇 프로세스는 재시작 전까지 새 채널 매핑을 바로 인식하지 못할 수 있어요."
+                f"브랜치: `{branch_name}`\n"
+                + (f"원본: `{normalized_github_url}`\n" if normalized_github_url else "")
+                + ("생성 방식: GitHub clone\n" if normalized_github_url else "생성 방식: 빈 레포 초기화\n")
+                + f"설정 반영: {', '.join(str(path) for path in updated_paths)}\n"
+                + "이미 실행 중인 다른 봇 프로세스는 재시작 전까지 새 채널 매핑을 바로 인식하지 못할 수 있어요."
             ),
             tone="success",
         )
@@ -3156,10 +3226,13 @@ async def new_session_command(
 
 
 @app_commands.command(name="new-repo", description="새 Git 레포와 대응 채널을 함께 만듭니다. 채널 전용.")
-@app_commands.describe(name="새 레포와 채널에 사용할 이름")
-async def new_repo_command(interaction: discord.Interaction, name: str) -> None:
+@app_commands.describe(
+    name="새 레포와 채널에 사용할 이름",
+    github_url="선택 사항: 이 GitHub 레포를 clone해서 시작",
+)
+async def new_repo_command(interaction: discord.Interaction, name: str, github_url: str | None = None) -> None:
     bot = get_bot_from_interaction(interaction)
-    await bot.handle_new_repo(interaction, name)
+    await bot.handle_new_repo(interaction, name, github_url)
 
 
 @app_commands.command(name="delete-repo", description="현재 채널에 연결된 Git 레포와 채널을 삭제합니다. 매우 위험합니다. 채널 전용.")

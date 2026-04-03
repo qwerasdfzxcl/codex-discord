@@ -21,6 +21,23 @@ DEFAULT_HISTORY_MESSAGES = 20
 DEFAULT_MAX_PROMPT_CHARS = 12000
 THREAD_BINDING_PATTERN = re.compile(r"^\[bot:(main|staging)\]\s*")
 STATE_DIRECTORY_NAME = ".codex-discord-state"
+DESTRUCTIVE_PROMPT_PATTERNS = (
+    r"\brm\b",
+    r"\bdel(?:ete)?\b",
+    r"\bremove\b",
+    r"\bunlink\b",
+    r"\berase\b",
+    r"\bdrop\s+table\b",
+    r"\btruncate\b",
+    r"\breset\s+--hard\b",
+    r"\bclean\s+-fd\b",
+    r"\bsudo\b",
+    r"삭제",
+    r"지워",
+    r"제거",
+    r"날려",
+    r"초기화",
+)
 
 
 class ConfigError(Exception):
@@ -82,6 +99,15 @@ class CodexTurnResult:
     stderr: str
     duration_seconds: float
     timed_out: bool = False
+
+
+@dataclass
+class PendingApproval:
+    thread_id: int
+    source_message_id: int
+    workspace: Path
+    prompt: str
+    requested_at: str
 
 
 def now_utc_iso() -> str:
@@ -194,6 +220,13 @@ def summarize_file_changes(file_changes: list[str]) -> str:
     if len(file_changes) > 20:
         lines.append(f"- ... and {len(file_changes) - 20} more")
     return "\n".join(lines)
+
+
+def prompt_requires_destructive_approval(prompt: str) -> bool:
+    lowered = prompt.strip().lower()
+    if not lowered:
+        return False
+    return any(re.search(pattern, lowered) for pattern in DESTRUCTIVE_PROMPT_PATTERNS)
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
@@ -440,6 +473,35 @@ class SessionStore:
         self._save()
 
 
+class ApprovalView(discord.ui.View):
+    def __init__(self, bot: "CodexDiscordBot", approval_id: str) -> None:
+        super().__init__(timeout=3600)
+        self.bot = bot
+        self.approval_id = approval_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.bot.config.allowed_user_id:
+            await interaction.response.send_message("You are not allowed to approve this action.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.danger)
+    async def approve(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.bot.handle_approval_click(interaction, self.approval_id, approved=True, view=self)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.secondary)
+    async def deny(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.bot.handle_approval_click(interaction, self.approval_id, approved=False, view=self)
+
+
 class CodexDiscordBot(commands.Bot):
     def __init__(self, config: AppConfig) -> None:
         intents = discord.Intents.default()
@@ -450,6 +512,7 @@ class CodexDiscordBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
         self.thread_locks: dict[int, asyncio.Lock] = {}
+        self.pending_approvals: dict[str, PendingApproval] = {}
         self.last_execution: ExecutionRecord | None = None
         state_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"{self.config.bot_role}-sessions.json"
         self.session_store = SessionStore(state_path)
@@ -508,6 +571,9 @@ class CodexDiscordBot(commands.Bot):
             return
         prompt = message_to_prompt(message)
         if not prompt:
+            return
+        if prompt_requires_destructive_approval(prompt):
+            await self.request_destructive_approval(message, workspace, prompt)
             return
 
         lock = self.get_thread_lock(thread.id)
@@ -669,6 +735,86 @@ class CodexDiscordBot(commands.Bot):
         await source_message.reply(chunks[0], mention_author=False)
         for chunk in chunks[1:]:
             await source_message.channel.send(chunk)
+
+    def build_approval_id(self, thread_id: int, source_message_id: int) -> str:
+        return f"{thread_id}:{source_message_id}"
+
+    async def request_destructive_approval(
+        self,
+        source_message: discord.Message,
+        workspace: Path,
+        prompt: str,
+    ) -> None:
+        approval_id = self.build_approval_id(source_message.channel.id, source_message.id)
+        self.pending_approvals[approval_id] = PendingApproval(
+            thread_id=source_message.channel.id,
+            source_message_id=source_message.id,
+            workspace=workspace.resolve(),
+            prompt=prompt,
+            requested_at=now_utc_iso(),
+        )
+        view = ApprovalView(self, approval_id)
+        await source_message.reply(
+            "This request looks destructive. Click `Approve` to send it to Codex or `Deny` to cancel.",
+            view=view,
+            mention_author=False,
+        )
+
+    def disable_view_buttons(self, view: discord.ui.View) -> None:
+        for item in view.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
+    async def handle_approval_click(
+        self,
+        interaction: discord.Interaction,
+        approval_id: str,
+        approved: bool,
+        view: ApprovalView,
+    ) -> None:
+        pending = self.pending_approvals.get(approval_id)
+        if pending is None:
+            self.disable_view_buttons(view)
+            await interaction.response.edit_message(
+                content="This approval request is no longer available.",
+                view=view,
+            )
+            return
+
+        self.pending_approvals.pop(approval_id, None)
+        self.disable_view_buttons(view)
+
+        if not approved:
+            await interaction.response.edit_message(content="Request denied.", view=view)
+            return
+
+        channel = self.get_channel(pending.thread_id)
+        if not isinstance(channel, discord.Thread):
+            maybe_channel = await self.fetch_channel(pending.thread_id)
+            channel = maybe_channel if isinstance(maybe_channel, discord.Thread) else None
+        if not isinstance(channel, discord.Thread):
+            await interaction.response.edit_message(content="Thread no longer exists. Approval canceled.", view=view)
+            return
+
+        try:
+            source_message = await channel.fetch_message(pending.source_message_id)
+        except discord.HTTPException:
+            await interaction.response.edit_message(content="Original message not found. Approval canceled.", view=view)
+            return
+
+        lock = self.get_thread_lock(channel.id)
+        if lock.locked():
+            await interaction.response.send_message(
+                "A Codex task is already running in this thread. Wait for it to finish.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.edit_message(content="Approved. Sending request to Codex...", view=view)
+        async with lock:
+            async with channel.typing():
+                response_text = await self.run_codex_turn_for_message(channel, pending.workspace, pending.prompt)
+            await self.send_message_output(source_message, response_text, filename_prefix=f"message-{channel.id}")
 
     async def run_process(self, args: list[str], cwd: Path, timeout_seconds: int | None = None) -> ProcessResult:
         timeout = timeout_seconds or self.config.timeout_seconds

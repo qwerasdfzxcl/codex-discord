@@ -21,6 +21,10 @@ DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_HISTORY_MESSAGES = 20
 DEFAULT_MAX_PROMPT_CHARS = 12000
 THREAD_BINDING_PATTERN = re.compile(r"^\[bot:(main|staging)\]\s*")
+BOT_CONTEXT_SKIP_PREFIXES = (
+    "A Codex task is already running in this thread.",
+    "Output was too long, attached as `",
+)
 
 
 class ConfigError(Exception):
@@ -88,6 +92,42 @@ def chunk_text(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
         remaining = remaining[split_at:].lstrip("\n")
 
     return chunks
+
+
+def sanitize_bot_context_message(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if any(stripped.startswith(prefix) for prefix in BOT_CONTEXT_SKIP_PREFIXES):
+        return ""
+
+    if stripped.startswith("workspace: "):
+        _, _, remainder = stripped.partition("\n\n")
+        if remainder.strip():
+            stripped = remainder.strip()
+
+    stderr_marker = "\n\nstderr:\n"
+    if stderr_marker in stripped:
+        stripped = stripped.split(stderr_marker, 1)[0].rstrip()
+
+    return stripped
+
+
+def format_codex_user_response(
+    result: "ProcessResult",
+    output_text: str,
+    timeout_seconds: int,
+) -> str:
+    if result.timed_out:
+        return f"codex exec timed out after {timeout_seconds} seconds."
+
+    if result.returncode == 0:
+        return output_text or result.stdout or "codex exec finished without output."
+
+    if output_text:
+        return output_text
+
+    return f"codex exec failed with exit code {result.returncode}."
 
 
 def split_thread_binding(name: str) -> tuple[str | None, str]:
@@ -258,7 +298,7 @@ def load_app_config() -> AppConfig:
     restart_staging_args = parse_command_args(
         "main_commands.restart_staging",
         main_commands.get("restart_staging"),
-        default=["/usr/bin/systemctl", "restart", "codex-discord-staging"],
+        default=["./scripts/systemd-restart-service.sh", "codex-discord-staging"],
     )
     deploy_args = parse_command_args(
         "main_commands.deploy",
@@ -567,6 +607,11 @@ class CodexDiscordBot(commands.Bot):
                 attachments = [f"attachment: {attachment.filename} ({attachment.url})" for attachment in item.attachments]
                 content = "\n".join(filter(None, [content, *attachments]))
 
+            if is_bot_message:
+                content = sanitize_bot_context_message(content)
+                if not content and not item.attachments:
+                    continue
+
             role = "assistant" if is_bot_message else "user"
             lines.append(f"[{role}] {item.author.display_name}:")
             lines.append(content)
@@ -602,27 +647,25 @@ class CodexDiscordBot(commands.Bot):
             output_text = ""
             if temp_output_path and Path(temp_output_path).is_file():
                 output_text = Path(temp_output_path).read_text(encoding="utf-8", errors="replace").strip()
-
-            sections = [f"workspace: {workspace}"]
-            if result.timed_out:
-                sections.append(f"codex exec timed out after {self.config.timeout_seconds} seconds.")
-            elif result.returncode == 0:
-                sections.append(output_text or result.stdout or "codex exec finished without output.")
-            else:
-                sections.append(f"codex exec failed with exit code {result.returncode}.")
-                if output_text:
-                    sections.append(output_text)
-                elif result.stdout:
-                    sections.append(f"stdout:\n{result.stdout}")
+            response_text = format_codex_user_response(
+                result=result,
+                output_text=output_text,
+                timeout_seconds=self.config.timeout_seconds,
+            )
 
             if result.stderr:
-                sections.append(f"stderr:\n{result.stderr}")
+                logging.warning(
+                    "codex exec stderr workspace=%s returncode=%s stderr=%s",
+                    workspace,
+                    result.returncode,
+                    result.stderr,
+                )
 
             status = "success" if result.returncode == 0 and not result.timed_out else "failed"
             summary = f"{status} in {result.duration_seconds:.1f}s"
             self.record_execution("ask", status, workspace, result.duration_seconds, summary)
 
-            return "\n\n".join(sections)
+            return response_text
         except FileNotFoundError:
             summary = f"missing executable: {self.config.codex_bin}"
             self.record_execution("ask", "failed", workspace, 0.0, summary)

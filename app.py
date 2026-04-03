@@ -33,10 +33,19 @@ EMBED_COLOR_INFO = 0x5865F2
 EMBED_COLOR_SUCCESS = 0x57F287
 EMBED_COLOR_WARNING = 0xFEE75C
 EMBED_COLOR_ERROR = 0xED4245
+NVM_NODE_BIN_PATH = Path.home() / ".nvm" / "versions" / "node" / "v22.22.2" / "bin"
 
 
 class ConfigError(Exception):
     pass
+
+
+def build_codex_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if NVM_NODE_BIN_PATH.exists():
+        current_path = env.get("PATH", "")
+        env["PATH"] = f"{NVM_NODE_BIN_PATH}{os.pathsep}{current_path}" if current_path else str(NVM_NODE_BIN_PATH)
+    return env
 
 
 @dataclass(frozen=True)
@@ -708,6 +717,7 @@ class ThreadSessionRuntime:
                 "--listen",
                 "stdio://",
                 cwd=str(self.workspace),
+                env=build_codex_subprocess_env(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1030,6 +1040,7 @@ class ThreadSessionRuntime:
                     }
                 ],
                 "cwd": str(self.workspace),
+                "sandboxPolicy": self.bot.resolve_turn_sandbox_policy(self.discord_thread_id),
             },
         )
         turn = response.get("turn")
@@ -1750,6 +1761,19 @@ class CodexDiscordBot(commands.Bot):
             ("--sandbox", "-s"),
         )
         return sandbox or "workspace-write"
+
+    def resolve_turn_sandbox_policy(self, thread_id: int | None = None) -> dict[str, object] | None:
+        sandbox_mode = self.resolve_sandbox_mode(thread_id)
+        if sandbox_mode == "danger-full-access":
+            return {"type": "dangerFullAccess"}
+        if sandbox_mode == "workspace-write":
+            return {
+                "type": "workspaceWrite",
+                "networkAccess": True,
+                "readOnlyAccess": {"type": "fullAccess"},
+                "writableRoots": [str(Path.home() / ".codex" / "memories")],
+            }
+        return None
 
     async def reset_thread_runtime(self, thread_id: int) -> None:
         runtime = self.session_runtimes.pop(thread_id, None)

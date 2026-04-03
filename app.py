@@ -87,6 +87,12 @@ class ThreadSessionRecord:
 
 
 @dataclass
+class ThreadPolicyRecord:
+    dangerously_bypass_approvals_and_sandbox: bool
+    updated_at: str
+
+
+@dataclass
 class PendingApproval:
     runtime: "ThreadSessionRuntime"
     request_id: int | str
@@ -496,6 +502,67 @@ class SessionStore:
         self._save()
 
 
+class ThreadPolicyStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._records: dict[str, ThreadPolicyRecord] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.is_file():
+            return
+
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logging.exception("Failed to load thread policy store from %s", self.path)
+            return
+
+        raw_threads = payload.get("threads", {})
+        if not isinstance(raw_threads, dict):
+            return
+
+        for thread_id, raw_record in raw_threads.items():
+            if not isinstance(raw_record, dict):
+                continue
+            dangerously_bypass = raw_record.get("dangerously_bypass_approvals_and_sandbox")
+            updated_at = raw_record.get("updated_at")
+            if not isinstance(dangerously_bypass, bool):
+                continue
+            if not isinstance(updated_at, str) or not updated_at:
+                updated_at = now_utc_iso()
+            self._records[thread_id] = ThreadPolicyRecord(
+                dangerously_bypass_approvals_and_sandbox=dangerously_bypass,
+                updated_at=updated_at,
+            )
+
+    def _save(self) -> None:
+        payload = {
+            "threads": {
+                thread_id: {
+                    "dangerously_bypass_approvals_and_sandbox": record.dangerously_bypass_approvals_and_sandbox,
+                    "updated_at": record.updated_at,
+                }
+                for thread_id, record in self._records.items()
+            }
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def get(self, thread_id: int) -> ThreadPolicyRecord | None:
+        return self._records.get(str(thread_id))
+
+    def set_danger_mode(self, thread_id: int, enabled: bool) -> None:
+        if enabled:
+            self._records[str(thread_id)] = ThreadPolicyRecord(
+                dangerously_bypass_approvals_and_sandbox=True,
+                updated_at=now_utc_iso(),
+            )
+        else:
+            self._records.pop(str(thread_id), None)
+        self._save()
+
+
 @dataclass
 class AppServerTurnState:
     turn_id: str
@@ -713,6 +780,34 @@ class ThreadSessionRuntime:
         self.current_turns.clear()
         self.pending_turn_state = None
 
+    async def shutdown(self) -> None:
+        self.started = False
+        process = self.process
+        if process is not None and process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+
+        for task in (self.stdout_task, self.stderr_task):
+            if task is None:
+                continue
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logging.exception("Failed while shutting down app-server task thread=%s", self.discord_thread_id)
+
+        self.process = None
+        self.stdout_task = None
+        self.stderr_task = None
+        self.fail_pending(RuntimeError("app-server runtime shut down"))
+
     async def handle_rpc_message(self, message: dict[str, object]) -> None:
         message_id = message.get("id")
         method = message.get("method")
@@ -869,16 +964,16 @@ class ThreadSessionRuntime:
         resume_params: dict[str, object] = {
             "threadId": "",
             "cwd": str(self.workspace),
-            "approvalPolicy": self.bot.resolve_approval_policy(),
+            "approvalPolicy": self.bot.resolve_approval_policy(self.discord_thread_id),
             "approvalsReviewer": "user",
-            "sandbox": self.bot.resolve_sandbox_mode(),
+            "sandbox": self.bot.resolve_sandbox_mode(self.discord_thread_id),
             "persistExtendedHistory": False,
         }
         start_params: dict[str, object] = {
             "cwd": str(self.workspace),
-            "approvalPolicy": self.bot.resolve_approval_policy(),
+            "approvalPolicy": self.bot.resolve_approval_policy(self.discord_thread_id),
             "approvalsReviewer": "user",
-            "sandbox": self.bot.resolve_sandbox_mode(),
+            "sandbox": self.bot.resolve_sandbox_mode(self.discord_thread_id),
             "serviceName": f"codex-discord-{self.bot.config.bot_role}",
             "experimentalRawEvents": False,
             "persistExtendedHistory": False,
@@ -1048,6 +1143,8 @@ class CodexDiscordBot(commands.Bot):
         self.last_execution: ExecutionRecord | None = None
         state_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"{self.config.bot_role}-app-server-threads.json"
         self.session_store = SessionStore(state_path)
+        policy_state_path = self.config.checkout_path / STATE_DIRECTORY_NAME / f"{self.config.bot_role}-thread-policies.json"
+        self.thread_policy_store = ThreadPolicyStore(policy_state_path)
 
     def build_embed(self, title: str, description: str | None = None, tone: str = "info") -> discord.Embed:
         color = EMBED_COLOR_INFO
@@ -1169,6 +1266,8 @@ class CodexDiscordBot(commands.Bot):
         status_command.name = command_name_for_role("status", self.config.bot_role)
         diff_command.name = command_name_for_role("diff", self.config.bot_role)
         break_command.name = command_name_for_role("break", self.config.bot_role)
+        danger_on_command.name = command_name_for_role("danger-on", self.config.bot_role)
+        danger_off_command.name = command_name_for_role("danger-off", self.config.bot_role)
         restart_command.name = "restart"
         restart_staging_command.name = "restart-staging"
         deploy_command.name = "deploy"
@@ -1180,6 +1279,8 @@ class CodexDiscordBot(commands.Bot):
         self.tree.add_command(status_command, guild=guild)
         self.tree.add_command(diff_command, guild=guild)
         self.tree.add_command(break_command, guild=guild)
+        self.tree.add_command(danger_on_command, guild=guild)
+        self.tree.add_command(danger_off_command, guild=guild)
 
         if self.config.bot_role == "main":
             self.tree.add_command(restart_command, guild=guild)
@@ -1619,10 +1720,27 @@ class CodexDiscordBot(commands.Bot):
     def resolve_codex_model(self) -> str | None:
         return self.extract_arg_value(self.config.codex_exec_args, ("--model", "-m"))
 
-    def resolve_approval_policy(self) -> object:
+    def is_thread_danger_mode_enabled(self, thread_id: int | None) -> bool:
+        if thread_id is None:
+            return False
+        record = self.thread_policy_store.get(thread_id)
+        return record is not None and record.dangerously_bypass_approvals_and_sandbox
+
+    def describe_thread_danger_mode(self, thread_id: int | None) -> str:
+        if thread_id is None:
+            return "해당 없음"
+        if self.is_thread_danger_mode_enabled(thread_id):
+            return "켜짐 (스레드 override)"
+        return "꺼짐"
+
+    def resolve_approval_policy(self, thread_id: int | None = None) -> object:
+        if self.is_thread_danger_mode_enabled(thread_id):
+            return "never"
         return self.extract_arg_value(self.config.codex_global_args, ("--ask-for-approval", "-a")) or "on-request"
 
-    def resolve_sandbox_mode(self) -> str:
+    def resolve_sandbox_mode(self, thread_id: int | None = None) -> str:
+        if self.is_thread_danger_mode_enabled(thread_id):
+            return "danger-full-access"
         if "--dangerously-bypass-approvals-and-sandbox" in self.config.codex_global_args:
             return "danger-full-access"
         if "--full-auto" in self.config.codex_global_args:
@@ -1632,6 +1750,83 @@ class CodexDiscordBot(commands.Bot):
             ("--sandbox", "-s"),
         )
         return sandbox or "workspace-write"
+
+    async def reset_thread_runtime(self, thread_id: int) -> None:
+        runtime = self.session_runtimes.pop(thread_id, None)
+        if runtime is not None:
+            await runtime.shutdown()
+
+    async def handle_danger_mode_toggle(self, interaction: discord.Interaction, enabled: bool) -> None:
+        command_name = command_name_for_role("danger-on" if enabled else "danger-off", self.config.bot_role)
+        if not await self.ensure_allowed_or_reply(interaction):
+            return
+        if not await self.ensure_thread_only(interaction, command_name):
+            return
+        if not await self.ensure_thread_owned(interaction):
+            return
+
+        thread, workspace = self.resolve_thread_workspace(interaction, require_thread=True)
+        if thread is None or workspace is None:
+            await self.send_interaction_embed(
+                interaction,
+                title="워크스페이스 연결 필요",
+                description=f"`/{command_name}` 명령은 워크스페이스가 연결된 세션 스레드에서만 사용할 수 있어요.",
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        runtime = self.session_runtimes.get(thread.id)
+        active_turn = runtime.get_active_turn_state() if runtime is not None else None
+        pending_approvals = self.get_pending_approvals_for_thread(thread.id)
+        if self.get_thread_lock(thread.id).locked() or active_turn is not None or pending_approvals:
+            await self.send_interaction_embed(
+                interaction,
+                title="지금은 변경할 수 없음",
+                description=(
+                    "현재 이 스레드에서 진행 중인 Codex turn 또는 승인 요청이 있어요.\n"
+                    f"먼저 `/{command_name_for_role('break', self.config.bot_role)}` 로 작업을 중단한 뒤 다시 시도해 주세요."
+                ),
+                tone="warning",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        already_enabled = self.is_thread_danger_mode_enabled(thread.id)
+        if already_enabled == enabled:
+            await self.send_interaction_embed(
+                interaction,
+                title="설정 변경 없음",
+                description=(
+                    f"이 스레드 위험 모드는 이미 `{self.describe_thread_danger_mode(thread.id)}` 상태예요.\n"
+                    f"유효 승인 정책: `{self.resolve_approval_policy(thread.id)}`\n"
+                    f"유효 샌드박스: `{self.resolve_sandbox_mode(thread.id)}`"
+                ),
+                tone="info",
+                ephemeral=True,
+            )
+            return
+
+        self.thread_policy_store.set_danger_mode(thread.id, enabled)
+        self.session_store.delete(thread.id)
+        await self.reset_thread_runtime(thread.id)
+
+        action_label = "켜짐" if enabled else "꺼짐"
+        summary = f"스레드 위험 모드 {action_label}"
+        self.record_execution(command_name, "success", workspace, 0.0, summary)
+        await self.send_interaction_embed(
+            interaction,
+            title=f"위험 모드 {action_label}",
+            description=(
+                f"적용 대상 스레드: {thread.mention}\n"
+                f"유효 승인 정책: `{self.resolve_approval_policy(thread.id)}`\n"
+                f"유효 샌드박스: `{self.resolve_sandbox_mode(thread.id)}`\n"
+                "기존 session/runtime은 정리했고, 다음 요청부터 이 스레드에만 새 설정이 적용됩니다."
+            ),
+            tone="warning" if enabled else "success",
+            ephemeral=True,
+        )
 
     async def post_agent_message(
         self,
@@ -1915,6 +2110,7 @@ class CodexDiscordBot(commands.Bot):
         thread, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
         current_thread_busy = False
         thread_session: ThreadSessionRecord | None = None
+        thread_id = thread.id if thread is not None else None
         if thread is not None:
             current_thread_busy = self.get_thread_lock(thread.id).locked()
             if workspace is not None:
@@ -1926,8 +2122,9 @@ class CodexDiscordBot(commands.Bot):
             f"현재 작업 중인 스레드 수: {self.active_thread_count()}",
             f"이 스레드 실행 중 여부: {'예' if current_thread_busy else '아니요'}",
             f"모델: {self.resolve_codex_model() or '기본값'}",
-            f"승인 정책: {self.resolve_approval_policy()}",
-            f"샌드박스: {self.resolve_sandbox_mode()}",
+            f"승인 정책: {self.resolve_approval_policy(thread_id)}",
+            f"샌드박스: {self.resolve_sandbox_mode(thread_id)}",
+            f"이 스레드 위험 모드: {self.describe_thread_danger_mode(thread_id)}",
         ]
 
         if workspace is not None:
@@ -1976,6 +2173,7 @@ class CodexDiscordBot(commands.Bot):
         thread, workspace = self.resolve_thread_workspace(interaction, require_thread=False)
         current_thread_busy = False
         thread_session: ThreadSessionRecord | None = None
+        thread_id = thread.id if thread is not None else None
         if thread is not None:
             current_thread_busy = self.get_thread_lock(thread.id).locked()
             if workspace is not None:
@@ -2015,8 +2213,9 @@ class CodexDiscordBot(commands.Bot):
             (
                 f"체크아웃: {self.config.checkout_path}\n"
                 f"모델: {self.resolve_codex_model() or '기본값'}\n"
-                f"승인 정책: {self.resolve_approval_policy()}\n"
-                f"샌드박스: {self.resolve_sandbox_mode()}"
+                f"승인 정책: {self.resolve_approval_policy(thread_id)}\n"
+                f"샌드박스: {self.resolve_sandbox_mode(thread_id)}\n"
+                f"이 스레드 위험 모드: {self.describe_thread_danger_mode(thread_id)}"
             ),
             inline=False,
         )
@@ -2820,6 +3019,12 @@ class CodexDiscordBot(commands.Bot):
             ephemeral=True,
         )
 
+    async def handle_danger_on(self, interaction: discord.Interaction) -> None:
+        await self.handle_danger_mode_toggle(interaction, enabled=True)
+
+    async def handle_danger_off(self, interaction: discord.Interaction) -> None:
+        await self.handle_danger_mode_toggle(interaction, enabled=False)
+
     async def handle_restart_staging(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
@@ -2956,6 +3161,18 @@ async def diff_command(interaction: discord.Interaction) -> None:
 async def break_command(interaction: discord.Interaction) -> None:
     bot = get_bot_from_interaction(interaction)
     await bot.handle_break(interaction)
+
+
+@app_commands.command(name="danger-on", description="현재 스레드에만 위험 모드(승인/샌드박스 우회)를 켭니다. 스레드 전용.")
+async def danger_on_command(interaction: discord.Interaction) -> None:
+    bot = get_bot_from_interaction(interaction)
+    await bot.handle_danger_on(interaction)
+
+
+@app_commands.command(name="danger-off", description="현재 스레드의 위험 모드를 끄고 기본 설정으로 되돌립니다. 스레드 전용.")
+async def danger_off_command(interaction: discord.Interaction) -> None:
+    bot = get_bot_from_interaction(interaction)
+    await bot.handle_danger_off(interaction)
 
 
 @app_commands.command(name="restart", description="main 봇 서비스를 재시작합니다. main 봇 전용. 채널/스레드 사용 가능.")

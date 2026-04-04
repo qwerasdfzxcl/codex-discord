@@ -1131,9 +1131,13 @@ class ThreadSessionRuntime:
                     turn_id,
                     BREAK_CONFIRM_TIMEOUT_SECONDS,
                 )
+                await self.shutdown()
                 return (
-                    False,
-                    f"중단 요청은 보냈지만 {BREAK_CONFIRM_TIMEOUT_SECONDS}초 안에 실제 중단을 확인하지 못했어요.",
+                    True,
+                    (
+                        f"중단 요청은 보냈지만 {BREAK_CONFIRM_TIMEOUT_SECONDS}초 안에 실제 중단을 확인하지 못했어요.\n"
+                        "앱서버 런타임을 강제로 재시작해서 이 스레드의 잠금 상태를 해제했어요."
+                    ),
                 )
 
             done, _ = await asyncio.wait(wait_targets, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)

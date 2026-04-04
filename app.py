@@ -30,6 +30,7 @@ THREAD_BINDING_PATTERN = re.compile(r"^\[bot:(main|staging)\]\s*")
 STATE_DIRECTORY_NAME = ".codex-discord-state"
 BACKGROUND_OPERATIONS_DIR_NAME = "background-operations"
 BACKGROUND_OPERATION_POLL_SECONDS = 5
+APP_SERVER_STREAM_LIMIT = 4 * 1024 * 1024
 EMBED_COLOR_INFO = 0x5865F2
 EMBED_COLOR_SUCCESS = 0x57F287
 EMBED_COLOR_WARNING = 0xFEE75C
@@ -751,12 +752,15 @@ class ThreadSessionRuntime:
                 "stdio://",
                 cwd=str(self.workspace),
                 env=build_codex_subprocess_env(),
+                limit=APP_SERVER_STREAM_LIMIT,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             self.stdout_task = asyncio.create_task(self.read_stdout_loop())
             self.stderr_task = asyncio.create_task(self.read_stderr_loop())
+            self.attach_reader_task(self.stdout_task, "stdout")
+            self.attach_reader_task(self.stderr_task, "stderr")
             request_id = self.next_request_id
             self.next_request_id += 1
             future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
@@ -782,7 +786,12 @@ class ThreadSessionRuntime:
         assert self.process is not None and self.process.stdout is not None
         stream = self.process.stdout
         while True:
-            line = await stream.readline()
+            try:
+                line = await stream.readline()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"app-server stdout line exceeded stream limit {APP_SERVER_STREAM_LIMIT} bytes"
+                ) from exc
             if not line:
                 break
             text = line.decode("utf-8", errors="replace").strip()
@@ -802,12 +811,39 @@ class ThreadSessionRuntime:
         assert self.process is not None and self.process.stderr is not None
         stream = self.process.stderr
         while True:
-            line = await stream.readline()
+            try:
+                line = await stream.readline()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"app-server stderr line exceeded stream limit {APP_SERVER_STREAM_LIMIT} bytes"
+                ) from exc
             if not line:
                 break
             text = line.decode("utf-8", errors="replace").rstrip()
             if text:
                 logging.warning("app-server stderr thread=%s %s", self.discord_thread_id, text)
+
+    def attach_reader_task(self, task: asyncio.Task[None], stream_name: str) -> None:
+        task.add_done_callback(lambda completed_task: self.handle_reader_task_done(completed_task, stream_name))
+
+    def handle_reader_task_done(self, task: asyncio.Task[None], stream_name: str) -> None:
+        if task.cancelled():
+            return
+        try:
+            exception = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exception is None:
+            return
+
+        logging.exception(
+            "app-server %s reader failed thread=%s",
+            stream_name,
+            self.discord_thread_id,
+            exc_info=(type(exception), exception, exception.__traceback__),
+        )
+        self.started = False
+        self.fail_pending(RuntimeError(f"app-server {stream_name} reader failed: {exception}"))
 
     def fail_pending(self, error: Exception) -> None:
         for future in self.pending_requests.values():

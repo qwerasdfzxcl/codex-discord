@@ -1518,6 +1518,32 @@ class CodexDiscordBot(commands.Bot):
     def resolve_repo_creation_base(self) -> Path:
         return self.config.checkout_path.resolve().parent.parent
 
+    def resolve_checkout_path_for_role(self, bot_role: str) -> Path | None:
+        if bot_role == self.config.bot_role:
+            return self.config.checkout_path.resolve()
+        candidate = (self.config.checkout_path.parent / bot_role).resolve()
+        if not candidate.is_dir():
+            return None
+        return candidate
+
+    def resolve_policy_store_path_for_role(self, bot_role: str) -> Path | None:
+        checkout_path = self.resolve_checkout_path_for_role(bot_role)
+        if checkout_path is None:
+            return None
+        return checkout_path / STATE_DIRECTORY_NAME / f"{bot_role}-thread-policies.json"
+
+    def set_thread_danger_mode_for_role(self, thread_id: int, bot_role: str, enabled: bool) -> bool:
+        if bot_role == self.config.bot_role:
+            self.thread_policy_store.set_danger_mode(thread_id, enabled)
+            return True
+
+        policy_store_path = self.resolve_policy_store_path_for_role(bot_role)
+        if policy_store_path is None:
+            return False
+
+        ThreadPolicyStore(policy_store_path).set_danger_mode(thread_id, enabled)
+        return True
+
     def resolve_config_sync_paths(self) -> list[Path]:
         paths = [self.config.config_path.resolve()]
         if is_relative_to(self.config.config_path, self.config.checkout_path):
@@ -2688,7 +2714,13 @@ class CodexDiscordBot(commands.Bot):
             tone="success",
         )
 
-    async def handle_new_session(self, interaction: discord.Interaction, target_bot_role: str, title: str) -> None:
+    async def handle_new_session(
+        self,
+        interaction: discord.Interaction,
+        target_bot_role: str,
+        title: str,
+        danger_enabled: bool = False,
+    ) -> None:
         if not await self.ensure_allowed_or_reply(interaction):
             return
         if not await self.ensure_channel_only(interaction, command_name_for_role("new-session", self.config.bot_role)):
@@ -2715,6 +2747,19 @@ class CodexDiscordBot(commands.Bot):
             return
 
         resolved_target_role = target_bot_role or "main"
+        if self.resolve_checkout_path_for_role(resolved_target_role) is None:
+            await self.send_interaction_embed(
+                interaction,
+                title="세션 생성 실패",
+                description=(
+                    f"대상 봇 역할 `{resolved_target_role}` 의 체크아웃 경로를 찾지 못했어요.\n"
+                    "BOT_ROLE별 checkout 구조와 실행 경로를 확인해 주세요."
+                ),
+                tone="error",
+                ephemeral=True,
+            )
+            return
+
         thread_name = format_thread_binding_name(resolved_target_role, title)
         try:
             thread = await parent_channel.create_thread(
@@ -2742,11 +2787,29 @@ class CodexDiscordBot(commands.Bot):
             )
             return
 
+        if not self.set_thread_danger_mode_for_role(thread.id, resolved_target_role, danger_enabled):
+            try:
+                await thread.delete(reason=f"세션 생성 롤백: thread policy 저장 실패 ({resolved_target_role})")
+            except discord.HTTPException:
+                logging.exception("Failed to roll back thread after policy write failure: thread=%s", thread.id)
+            await self.send_interaction_embed(
+                interaction,
+                title="세션 생성 실패",
+                description=(
+                    "새 스레드는 만들었지만 danger 설정을 저장하지 못해서 생성 작업을 취소했어요.\n"
+                    f"대상 봇 역할: `{resolved_target_role}`"
+                ),
+                tone="error",
+                ephemeral=True,
+            )
+            return
+
         await self.send_interaction_embed(
             interaction,
             title="세션 생성 완료",
             description=(
                 f"대상 봇: `{resolved_target_role}`\n"
+                f"위험 모드: `{'on' if danger_enabled else 'off'}`\n"
                 f"스레드: {thread.mention}\n"
                 f"워크스페이스: `{workspace}`"
             ),
@@ -3249,20 +3312,34 @@ async def ping_command(interaction: discord.Interaction) -> None:
 
 
 @app_commands.command(name="new-session", description="선택한 봇에 연결된 새 세션 스레드를 만듭니다. 채널 전용.")
-@app_commands.describe(target_bot_role="새 세션을 맡을 봇입니다. 기본값은 main", title="새 세션 스레드 제목")
+@app_commands.describe(
+    target_bot_role="새 세션을 맡을 봇입니다. 기본값은 main",
+    title="새 세션 스레드 제목",
+    danger="새 스레드 danger 모드. 기본값은 off",
+)
 @app_commands.choices(
     target_bot_role=[
         app_commands.Choice(name="메인", value="main"),
         app_commands.Choice(name="스테이징", value="staging"),
-    ]
+    ],
+    danger=[
+        app_commands.Choice(name="off (기본값)", value="off"),
+        app_commands.Choice(name="on", value="on"),
+    ],
 )
 async def new_session_command(
     interaction: discord.Interaction,
     title: str,
     target_bot_role: app_commands.Choice[str] | None = None,
+    danger: app_commands.Choice[str] | None = None,
 ) -> None:
     bot = get_bot_from_interaction(interaction)
-    await bot.handle_new_session(interaction, target_bot_role.value if target_bot_role else "main", title)
+    await bot.handle_new_session(
+        interaction,
+        target_bot_role.value if target_bot_role else "main",
+        title,
+        danger_enabled=(danger.value == "on") if danger else False,
+    )
 
 
 @app_commands.command(name="new-repo", description="새 Git 레포와 대응 채널을 함께 만듭니다. 채널 전용.")

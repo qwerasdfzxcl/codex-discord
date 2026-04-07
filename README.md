@@ -1,6 +1,6 @@
 # codex-discord
 
-Discord slash command로 Codex CLI를 감싸는 개인용 최소 wrapper입니다. 현재 구조는 실제 git worktree 기반입니다. `main` bot은 `main/` checkout에서 실행되고, `staging` bot은 `staging/` checkout에서 실행됩니다. 각 Discord 채널은 config에서 지정한 임의의 외부 repository path에 직접 매핑됩니다. 다만 `main` bot은 자기 자신의 `main/` checkout을 workspace로 쓰지 못하게 막아서, 운영 중인 wrapper 코드를 직접 수정하지 않게 해둔 상태입니다.
+Discord slash command로 Codex CLI를 감싸는 최소 wrapper입니다. 현재 구조는 실제 git worktree 기반입니다. `main` bot은 `main/` checkout에서 실행되고, `staging` bot은 `staging/` checkout에서 실행됩니다. 각 Discord 채널은 config에서 지정한 임의의 외부 repository path에 직접 매핑됩니다. 다만 `main` bot은 자기 자신의 `main/` checkout을 workspace로 쓰지 못하게 막아서, 운영 중인 wrapper 코드를 직접 수정하지 않게 해둔 상태입니다.
 
 ## 핵심 동작
 
@@ -116,8 +116,8 @@ LOG_LEVEL=INFO
 ```json
 {
   "channels": {
-    "111111111111111111": "/home/ubuntu/codex-discord/staging",
-    "222222222222222222": "/home/ubuntu/asdf"
+    "111111111111111111": "/srv/workspaces/codex-discord/staging",
+    "222222222222222222": "/srv/workspaces/example-repo"
   },
   "timeout_seconds": 900,
   "history_messages": 20,
@@ -166,7 +166,7 @@ LOG_LEVEL=INFO
 - 절대경로를 권장합니다.
 - 상대경로를 쓰면 현재 `config.json` 파일이 있는 디렉터리 기준으로 해석됩니다.
 - `main` bot은 자기 자신의 `main/` checkout을 workspace로 매핑할 수 없습니다.
-- `codex-discord` 프로젝트 자체를 관리하려면 채널을 `.../codex-discord/staging`에 매핑해야 합니다.
+- `codex-discord` 프로젝트 자체를 관리하려면 채널을 `.../codex-discord/staging` 같은 staging checkout 경로에 매핑해야 합니다.
 - `restart`, `restart-staging`, `deploy`는 `scripts/systemd-restart-service.sh`를 통해 서비스를 재시작합니다.
 - system service를 쓸 경우, bot 실행 사용자에게 passwordless sudo로 `systemctl restart codex-discord-staging`와 `systemctl restart codex-discord-main` 권한을 줘야 합니다.
 - thread별 Codex session id는 `staging/.codex-discord-state/staging-app-server-threads.json`에 저장됩니다.
@@ -204,8 +204,8 @@ python app.py
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp /home/qwerasdfzxcl/codex-discord/main/systemd/codex-discord-main.service ~/.config/systemd/user/
-cp /home/qwerasdfzxcl/codex-discord/staging/systemd/codex-discord-staging.service ~/.config/systemd/user/
+cp /srv/codex-discord/main/systemd/codex-discord-main.service ~/.config/systemd/user/
+cp /srv/codex-discord/staging/systemd/codex-discord-staging.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now codex-discord-main
 systemctl --user enable --now codex-discord-staging
@@ -214,7 +214,7 @@ systemctl --user enable --now codex-discord-staging
 로그아웃 후에도 계속 돌릴 계획이면 root로 한 번만 다음을 실행합니다.
 
 ```bash
-sudo loginctl enable-linger qwerasdfzxcl
+sudo loginctl enable-linger "$USER"
 ```
 
 ## 배포 스크립트
@@ -251,3 +251,14 @@ sudo loginctl enable-linger qwerasdfzxcl
 - 웹 UI 없음
 - 다중 사용자 권한 시스템 없음
 - 자동 merge, 자동 rollback 없음
+
+## 공개 전 체크리스트
+
+- `.env`, `config/config.json`, `.codex-discord-state/`는 기본적으로 git에 포함되지 않습니다.
+- public repo로 올리기 전에는 실제 bot token, Discord user id, guild id, workspace 경로가 추적 파일에 없는지 다시 확인하세요.
+- `scripts/deploy-prod.sh`와 `scripts/systemd-restart-service.sh`는 예시 운영 스크립트이므로, 실제 환경에 맞게 서비스 이름과 권한 정책을 조정해야 합니다.
+- 배포 정책을 분명히 하려면 repo 루트의 `LICENSE` 파일 내용을 검토하세요.
+
+## License
+
+MIT

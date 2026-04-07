@@ -1,7 +1,7 @@
 {
   "channels": {
-    "111111111111111111": "/home/ubuntu/codex-discord/staging",
-    "222222222222222222": "/home/ubuntu/asdf"
+    "111111111111111111": "/srv/workspaces/codex-discord/staging",
+    "222222222222222222": "/srv/workspaces/example-repo"
   },
   "timeout_seconds": 900,
   "history_messages": 20,

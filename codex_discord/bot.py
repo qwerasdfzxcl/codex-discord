@@ -30,6 +30,7 @@ from codex_discord.core import (
     GitSummary,
     ProcessResult,
     SessionStore,
+    ThreadSessionRecord,
     ThreadPolicyStore,
     build_codex_subprocess_env,
     chunk_text,

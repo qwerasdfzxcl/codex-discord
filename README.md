@@ -1,71 +1,77 @@
 # codex-discord
 
-Discord slash command로 Codex CLI를 감싸는 최소 wrapper입니다. 현재 구조는 실제 git worktree 기반입니다. `main` bot은 `main/` checkout에서 실행되고, `staging` bot은 `staging/` checkout에서 실행됩니다. 각 Discord 채널은 config에서 지정한 외부 repository path에 직접 매핑됩니다.
+Discord에서 Codex CLI를 쓰기 위한 최소 wrapper다.
 
-## 핵심 동작
+기본 사용 흐름은 단순하다.
 
-- Discord 채널 하나를 하나의 workspace에 매핑
-- 해당 채널의 각 thread를 하나의 작업 세션으로 사용
-- `/new-session` 또는 `/new-session-staging`은 부모 채널에서 새 thread를 만들고, 선택한 bot role과 danger 모드로 즉시 바인딩
-- thread 이름에 `[bot:staging]` prefix가 있으면 staging bot이 담당하고, 그 외 thread는 모두 main bot이 담당
-- 담당 bot이 있는 thread에서 사용자가 보내는 일반 메시지 하나하나가 Codex session turn 트리거가 됨
-- staging bot은 `codex app-server` 기반으로 thread별 Codex session을 유지함
-- 각 thread는 첫 메시지에서 Codex thread를 만들고, 이후에는 같은 thread를 다시 resume해서 이어감
-- 출력은 Discord에 다시 올리고, 길면 여러 메시지 또는 첨부 파일로 전송
-- Codex가 중간에 명령 실행이나 권한 상승 승인을 요구하면 Discord 버튼으로 `Approve / Deny` 가능
-- 같은 thread에서는 lock으로 동시 실행 방지
+- Discord 채널 하나를 하나의 workspace에 연결한다.
+- `/new-session`으로 작업 thread를 만든다.
+- thread 안에서 일반 메시지를 보내면 Codex가 같은 세션을 이어서 작업한다.
+- 필요하면 `/diff`, `/status`, `/break` 같은 명령으로 상태를 확인한다.
 
-## 포함 명령
+이 README는 `main` bot 하나만 운영하는 기준으로 설명한다. `staging` bot은 선택 사항이다.
 
-공통 명령:
+## 주요 기능
 
-- main bot 명령: `/ping`, `/new-session`, `/status`, `/diff`
-- staging bot 명령: `/ping-staging`, `/new-session-staging`, `/status-staging`, `/diff-staging`
-- channel only: `ping`, `ping-staging`, `new-session`, `new-session-staging`, `new-repo`, `new-repo-staging`
-- thread only: `status`, `status-staging`, `diff`, `diff-staging`
-- channel or thread: `restart`, `restart-staging`, `deploy`
+- 채널별 workspace 매핑
+- thread별 Codex session 유지
+- Discord 메시지를 Codex turn으로 전달
+- 긴 출력은 여러 메시지나 파일로 분할 전송
+- Codex 승인 요청을 Discord 버튼으로 처리
+- `/new-repo`로 새 repository와 채널 생성
+- `/deploy`, `/restart` 같은 운영 명령 지원
 
-`main` bot 전용 명령:
+## 기본 사용법
 
+일반적인 흐름은 이렇다.
+
+1. 관리용 채널 하나를 workspace에 연결한다.
+2. `/new-repo`로 새 repository와 대응 채널을 만든다.
+3. 해당 채널에서 `/new-session`으로 작업 thread를 만든다.
+4. thread 안에서 자연어로 요청한다.
+5. 필요하면 `/status`, `/diff`, `/break`를 사용한다.
+
+예:
+
+1. `/new-repo name:todo-list`
+2. 생성된 `#todo-list` 채널로 이동
+3. `/new-session title:initial-setup danger:off`
+4. thread 안에서 `FastAPI로 TODO CRUD 골격 만들어줘` 전송
+
+## 주요 명령
+
+`main` bot 기준:
+
+- `/ping`: 봇 상태 확인
+- `/new-repo`: 새 Git repository와 채널 생성
+- `/delete-repo`: 현재 채널의 repository와 채널 삭제
+- `/new-session`: 새 작업 thread 생성
+- `/status`: 현재 thread의 상태 확인
+- `/diff`: 현재 workspace 변경 사항 확인
+- `/break`: 실행 중인 작업 중단
 - `/restart`: main bot 서비스 재시작
 - `/restart-staging`: staging bot 서비스 재시작
-- `/deploy`: 외부 배포 스크립트 실행
+- `/deploy`: 배포 스크립트 실행
 
-`staging` bot은 `restart`, `restart-staging`, `deploy`를 slash command로 등록하지 않습니다.
-
-주의:
-
-- Discord는 bot 코드만으로 "채널에서는 channel-only 명령만 UI에 보이고, 특정 thread에서는 담당 bot 명령만 보이게" 하는 식의 per-thread slash command 필터링을 지원하지 않습니다.
-- 그래서 이 프로젝트는 명령 이름을 분리하고, 잘못된 컨텍스트에서는 실행을 거부하는 방식으로 강제합니다.
+보통 사용자는 `/new-repo`, `/new-session`, thread 메시지, `/status`, `/diff` 정도만 쓰면 된다.
 
 ## 요구 환경
 
-- Ubuntu 22.04
+- Ubuntu 22.04 이상 권장
 - Python 3.11 이상 권장
 - `codex` CLI 설치 완료
-- Discord application에서 bot과 application commands 사용 가능
-- Discord developer portal에서 `MESSAGE CONTENT INTENT` 활성화 필요
-- thread 자동 바인딩을 위해 bot에 thread 이름 수정 권한이 필요함
-- `new-repo`에서 GitHub clone을 쓰려면 실행 환경에서 `github.com` 접근이 가능해야 함
-
-## 파일 구성
-
-- `app.py`: slash command 기반 봇 엔트리포인트
-- `requirements.txt`: Python 의존성
-- `.env.example`: 환경 변수 예시
-- `config/config.example.json`: 채널 매핑 및 실행 옵션 예시
-- `systemd/codex-discord-main.service`: main bot 서비스 예시
-- `systemd/codex-discord-staging.service`: staging bot 서비스 예시
-- `scripts/deploy-prod.sh`: main bot이 호출하는 단순 배포 예시 스크립트
+- Discord application과 application commands 사용 가능
+- Discord developer portal에서 `MESSAGE CONTENT INTENT` 활성화
+- thread 이름 변경 권한
+- `new-repo`에서 GitHub clone을 쓰려면 `github.com` 접근 가능
 
 ## 설치
 
-서버 또는 로컬에 다음 구조가 있다고 가정합니다.
+예시 경로:
 
 - `/srv/codex-discord/main`
-- `/srv/codex-discord/staging`
 
-각 checkout에서 공통으로:
+설치:
 
 ```bash
 python3 -m venv .venv
@@ -76,22 +82,9 @@ mkdir -p config
 cp config/config.example.json config/config.json
 ```
 
-그 다음 `main/.env`와 `staging/.env`를 각각 역할에 맞게 수정합니다.
-
 ## .env 설정
 
-staging 예시:
-
-```env
-DISCORD_BOT_TOKEN=your_staging_bot_token
-DISCORD_ALLOWED_USER_ID=123456789012345678
-BOT_ROLE=staging
-CODEX_DISCORD_CONFIG=config/config.json
-DISCORD_GUILD_ID=123456789012345678
-LOG_LEVEL=INFO
-```
-
-main 예시:
+예시:
 
 ```env
 DISCORD_BOT_TOKEN=your_main_bot_token
@@ -104,20 +97,20 @@ LOG_LEVEL=INFO
 
 의미:
 
+- `DISCORD_BOT_TOKEN`: Discord bot token
 - `DISCORD_ALLOWED_USER_ID`: 명령 실행을 허용할 단일 Discord user id
-- `BOT_ROLE`: `main` 또는 `staging`
-- `CODEX_DISCORD_CONFIG`: 현재 checkout 기준 설정 파일 경로. 기본값은 `config/config.json`
+- `BOT_ROLE`: `main`
+- `CODEX_DISCORD_CONFIG`: 설정 파일 경로. 기본값은 `config/config.json`
 - `DISCORD_GUILD_ID`: 지정하면 해당 guild에만 slash command를 빠르게 sync
 
-별도의 checkout 경로 환경변수는 받지 않습니다. 현재 실행 중인 `app.py` 위치가 자동으로 현재 checkout 경로가 됩니다.
-
 ## config/config.json 설정
+
+예시:
 
 ```json
 {
   "channels": {
-    "111111111111111111": "/srv/workspaces/codex-discord/staging",
-    "222222222222222222": "/srv/workspaces/example-repo"
+    "111111111111111111": "/srv/workspaces/example-repo"
   },
   "timeout_seconds": 900,
   "history_messages": 20,
@@ -150,38 +143,24 @@ LOG_LEVEL=INFO
 }
 ```
 
-의미:
+주요 항목:
 
 - `channels`: 부모 채널 ID -> workspace 경로 매핑
-- `codex_bin`: Codex 바이너리 경로 또는 이름
-- `codex_global_args`: `codex` 서브커맨드 앞에 붙는 전역 인자 배열. 예: `["-a", "on-request"]`
-- `codex_exec_args`: `codex exec` 뒤에 붙는 추가 인자 배열
-- `main_commands.restart`: `main` bot이 `/restart`에서 실행할 argv 배열
-- `main_commands.restart_staging`: `main` bot이 `/restart-staging`에서 실행할 argv 배열
-- `main_commands.deploy`: `main` bot이 `/deploy`에서 실행할 argv 배열
+- `timeout_seconds`: Codex 실행 timeout
+- `codex_bin`: Codex 바이너리 경로
+- `codex_global_args`: 전역 Codex 인자
+- `codex_exec_args`: `codex exec` 추가 인자
+- `main_commands`: 운영 명령에서 실행할 argv 배열
 
 운영 참고:
 
-- `channels` 값은 각 채널이 실제로 관리할 repository/workspace 경로입니다.
-- 절대경로를 권장합니다.
-- 상대경로를 쓰면 현재 `config.json` 파일이 있는 디렉터리 기준으로 해석됩니다.
-- `restart`, `restart-staging`, `deploy`는 `scripts/systemd-restart-service.sh`를 통해 서비스를 재시작합니다.
-- system service를 쓸 경우, bot 실행 사용자에게 passwordless sudo로 `systemctl restart codex-discord-staging`와 `systemctl restart codex-discord-main` 권한을 줘야 합니다.
-- thread별 Codex session id는 `staging/.codex-discord-state/staging-app-server-threads.json`에 저장됩니다.
-- CLI처럼 중간 승인 버튼을 받으려면 `codex_global_args`에 `["-a", "on-request"]`를 둡니다.
-- 승인 프롬프트를 완전히 끄려면 `codex_global_args`를 `["-a", "never"]`로 바꿀 수 있지만, 그 경우 Discord 버튼 승인 흐름은 나오지 않습니다.
+- `channels`는 부모 채널 기준으로 연결된다.
+- 절대경로를 권장한다.
+- 상대경로는 `config.json` 기준으로 해석된다.
+- `codex_global_args`에 `["-a", "on-request"]`를 두면 Discord 승인 버튼 흐름을 쓸 수 있다.
+- `["-a", "never"]`로 바꾸면 승인 버튼 없이 바로 실행된다.
 
 ## 실행
-
-staging:
-
-```bash
-cd /srv/codex-discord/staging
-. .venv/bin/activate
-python app.py
-```
-
-main:
 
 ```bash
 cd /srv/codex-discord/main
@@ -194,51 +173,45 @@ python app.py
 예시 서비스 파일:
 
 - `systemd/codex-discord-main.service`
-- `systemd/codex-discord-staging.service`
-
-권장 방식은 user service입니다.
 
 설치 예:
 
 ```bash
 mkdir -p ~/.config/systemd/user
 cp /srv/codex-discord/main/systemd/codex-discord-main.service ~/.config/systemd/user/
-cp /srv/codex-discord/staging/systemd/codex-discord-staging.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now codex-discord-main
-systemctl --user enable --now codex-discord-staging
 ```
 
-로그아웃 후에도 계속 돌릴 계획이면 root로 한 번만 다음을 실행합니다.
+로그아웃 후에도 계속 돌릴 계획이면:
 
 ```bash
 sudo loginctl enable-linger "$USER"
 ```
 
-## 배포 스크립트
+## 배포
 
-`scripts/deploy-prod.sh`는 git 기반 예시입니다.
+`/deploy`는 `scripts/deploy-prod.sh`를 호출한다.
 
-- `main` checkout에서 `staging` 브랜치를 `main`에 merge
-- merge가 성공하면 main 서비스 재시작
-- 서비스 재시작은 `scripts/systemd-restart-service.sh`를 통해 수행됩니다.
+현재 예시 스크립트는:
 
-필요에 따라 다음은 환경에 맞게 조정해야 합니다.
+- `staging` checkout을 `main`에 merge
+- 필요하면 `staging`, `main`을 각각 push
+- main 서비스 재시작
 
-- merge 정책
-- 서비스 이름
-- 권한과 sudo/systemd 정책
+즉 `deploy`를 쓰려면 필요에 따라 `staging` checkout도 같이 준비해야 한다.
 
-## 테스트 방법
+## 선택 기능: staging bot
 
-1. staging checkout에서 `.env`와 `config/config.json`을 채웁니다.
-2. `python app.py`로 staging bot을 올립니다.
-3. Discord에서 매핑된 채널에서 `/new-session-staging title:test-session danger:off` 또는 `/new-session title:test-session danger:on` 을 실행합니다.
-4. 생성된 thread에서 일반 메시지로 `현재 디렉터리 구조를 설명해줘`를 보냅니다.
-5. `/status` 또는 `/status-staging`으로 현재 역할과 최근 실행 상태를 확인합니다.
-6. workspace에 변경이 있으면 `/diff`로 변경 파일과 diff stat을 확인합니다.
-7. staging에서 커밋을 하나 만든 뒤 main bot에서 부모 채널 또는 해당 채널의 thread에서 `/deploy`를 실행합니다.
-8. main bot에서는 `/restart`, `/restart-staging`, `/deploy`가 보이고, staging bot에서는 보이지 않는지 확인합니다.
+`staging` bot은 선택 사항이다.
+
+있으면 좋은 점:
+
+- 새 wrapper 변경을 실험하기 쉬움
+- `main`과 `staging` 역할 분리 가능
+- `/new-session-staging`, `/status-staging` 같은 별도 명령 사용 가능
+
+없어도 `main` bot만으로 repository 생성, session 생성, Codex 작업은 가능하다.
 
 ## 구현 제한
 
@@ -248,13 +221,7 @@ sudo loginctl enable-linger "$USER"
 - DB 없음
 - 웹 UI 없음
 - 다중 사용자 권한 시스템 없음
-- 자동 merge, 자동 rollback 없음
-
-## 참고
-
-- `.env`, `config/config.json`, `.codex-discord-state/`는 기본적으로 git에 포함되지 않습니다.
-- `scripts/deploy-prod.sh`와 `scripts/systemd-restart-service.sh`는 예시 운영 스크립트입니다.
-- 공개 배포 시에는 서비스 이름, 권한 정책, workspace 경로를 실제 환경에 맞게 조정하세요.
+- 자동 rollback 없음
 
 ## License
 

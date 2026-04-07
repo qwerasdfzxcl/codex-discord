@@ -1,6 +1,6 @@
 # codex-discord
 
-Discord slash command로 Codex CLI를 감싸는 최소 wrapper입니다. 현재 구조는 실제 git worktree 기반입니다. `main` bot은 `main/` checkout에서 실행되고, `staging` bot은 `staging/` checkout에서 실행됩니다. 각 Discord 채널은 config에서 지정한 임의의 외부 repository path에 직접 매핑됩니다. 다만 `main` bot은 자기 자신의 `main/` checkout을 workspace로 쓰지 못하게 막아서, 운영 중인 wrapper 코드를 직접 수정하지 않게 해둔 상태입니다.
+Discord slash command로 Codex CLI를 감싸는 최소 wrapper입니다. 현재 구조는 실제 git worktree 기반입니다. `main` bot은 `main/` checkout에서 실행되고, `staging` bot은 `staging/` checkout에서 실행됩니다. 각 Discord 채널은 config에서 지정한 외부 repository path에 직접 매핑됩니다.
 
 ## 핵심 동작
 
@@ -160,13 +160,11 @@ LOG_LEVEL=INFO
 - `main_commands.restart_staging`: `main` bot이 `/restart-staging`에서 실행할 argv 배열
 - `main_commands.deploy`: `main` bot이 `/deploy`에서 실행할 argv 배열
 
-중요:
+운영 참고:
 
 - `channels` 값은 각 채널이 실제로 관리할 repository/workspace 경로입니다.
 - 절대경로를 권장합니다.
 - 상대경로를 쓰면 현재 `config.json` 파일이 있는 디렉터리 기준으로 해석됩니다.
-- `main` bot은 자기 자신의 `main/` checkout을 workspace로 매핑할 수 없습니다.
-- `codex-discord` 프로젝트 자체를 관리하려면 채널을 `.../codex-discord/staging` 같은 staging checkout 경로에 매핑해야 합니다.
 - `restart`, `restart-staging`, `deploy`는 `scripts/systemd-restart-service.sh`를 통해 서비스를 재시작합니다.
 - system service를 쓸 경우, bot 실행 사용자에게 passwordless sudo로 `systemctl restart codex-discord-staging`와 `systemctl restart codex-discord-main` 권한을 줘야 합니다.
 - thread별 Codex session id는 `staging/.codex-discord-state/staging-app-server-threads.json`에 저장됩니다.
@@ -225,7 +223,7 @@ sudo loginctl enable-linger "$USER"
 - merge가 성공하면 main 서비스 재시작
 - 서비스 재시작은 `scripts/systemd-restart-service.sh`를 통해 수행됩니다.
 
-실제 운영 전에 다음은 반드시 검토해야 합니다.
+필요에 따라 다음은 환경에 맞게 조정해야 합니다.
 
 - merge 정책
 - 서비스 이름
@@ -252,12 +250,11 @@ sudo loginctl enable-linger "$USER"
 - 다중 사용자 권한 시스템 없음
 - 자동 merge, 자동 rollback 없음
 
-## 공개 전 체크리스트
+## 참고
 
 - `.env`, `config/config.json`, `.codex-discord-state/`는 기본적으로 git에 포함되지 않습니다.
-- public repo로 올리기 전에는 실제 bot token, Discord user id, guild id, workspace 경로가 추적 파일에 없는지 다시 확인하세요.
-- `scripts/deploy-prod.sh`와 `scripts/systemd-restart-service.sh`는 예시 운영 스크립트이므로, 실제 환경에 맞게 서비스 이름과 권한 정책을 조정해야 합니다.
-- 배포 정책을 분명히 하려면 repo 루트의 `LICENSE` 파일 내용을 검토하세요.
+- `scripts/deploy-prod.sh`와 `scripts/systemd-restart-service.sh`는 예시 운영 스크립트입니다.
+- 공개 배포 시에는 서비스 이름, 권한 정책, workspace 경로를 실제 환경에 맞게 조정하세요.
 
 ## License
 

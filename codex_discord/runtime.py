@@ -457,7 +457,7 @@ class ThreadSessionRuntime:
                 self.pending_turn_state = None
                 logging.info("turn/start response thread=%s turn=%s", self.discord_thread_id, turn_id)
 
-        return await asyncio.wait_for(completion_future, timeout=self.bot.config.timeout_seconds)
+        return await completion_future
 
     async def interrupt_active_turn(self) -> tuple[bool, str]:
         record = self.bot.get_thread_session(self.discord_thread_id, self.workspace)

@@ -13,6 +13,8 @@ from codex_discord.core import (
     APP_SERVER_STREAM_LIMIT,
     BREAK_CONFIRM_TIMEOUT_SECONDS,
     build_codex_subprocess_env,
+    hash_developer_instructions,
+    load_developer_instructions,
     now_utc_iso,
 )
 
@@ -372,8 +374,10 @@ class ThreadSessionRuntime:
             raise RuntimeError("app-server is not running")
         await self.write_json({"jsonrpc": "2.0", "id": request_id, "result": result})
 
-    async def ensure_codex_thread(self) -> tuple[str, bool]:
+    async def ensure_codex_thread(self) -> tuple[str, str | None]:
         model = self.bot.resolve_codex_model()
+        developer_instructions = load_developer_instructions()
+        developer_instructions_hash = hash_developer_instructions(developer_instructions)
         resume_params: dict[str, object] = {
             "threadId": "",
             "cwd": str(self.workspace),
@@ -394,9 +398,16 @@ class ThreadSessionRuntime:
         if model:
             resume_params["model"] = model
             start_params["model"] = model
+        if developer_instructions:
+            resume_params["developerInstructions"] = developer_instructions
+            start_params["developerInstructions"] = developer_instructions
 
         record = self.bot.get_thread_session(self.discord_thread_id, self.workspace)
-        started_fresh_after_resume_failure = False
+        fresh_session_reason: str | None = None
+        if record is not None and record.developer_instructions_hash != developer_instructions_hash:
+            self.bot.session_store.delete(self.discord_thread_id)
+            record = None
+            fresh_session_reason = "developer_instructions_changed"
         if record is not None:
             try:
                 resume_params["threadId"] = record.session_id
@@ -404,7 +415,7 @@ class ThreadSessionRuntime:
             except Exception:
                 logging.exception("Failed to resume app-server thread for Discord thread %s", self.discord_thread_id)
                 self.bot.session_store.delete(self.discord_thread_id)
-                started_fresh_after_resume_failure = True
+                fresh_session_reason = "resume_failed"
                 response = await self.send_request("thread/start", start_params)
         else:
             response = await self.send_request("thread/start", start_params)
@@ -415,16 +426,28 @@ class ThreadSessionRuntime:
         codex_thread_id = thread.get("id")
         if not isinstance(codex_thread_id, str) or not codex_thread_id:
             raise RuntimeError("app-server thread response is missing id")
-        self.bot.session_store.set(self.discord_thread_id, codex_thread_id, self.workspace)
-        return codex_thread_id, started_fresh_after_resume_failure
+        self.bot.session_store.set(
+            self.discord_thread_id,
+            codex_thread_id,
+            self.workspace,
+            developer_instructions_hash=developer_instructions_hash,
+        )
+        return codex_thread_id, fresh_session_reason
 
     async def run_turn(self, prompt: str, source_message: discord.Message) -> dict[str, object]:
-        codex_thread_id, started_fresh_after_resume_failure = await self.ensure_codex_thread()
-        if started_fresh_after_resume_failure:
+        codex_thread_id, fresh_session_reason = await self.ensure_codex_thread()
+        if fresh_session_reason == "resume_failed":
             await self.bot.post_agent_message(
                 self.discord_thread_id,
                 source_message.id,
                 "기존 Codex 세션 복원에 실패해서 새 세션으로 전환했어요.",
+                reply_to_source=True,
+            )
+        elif fresh_session_reason == "developer_instructions_changed":
+            await self.bot.post_agent_message(
+                self.discord_thread_id,
+                source_message.id,
+                "Codex developer instructions가 변경되어 새 세션으로 전환했어요.",
                 reply_to_source=True,
             )
         completion_future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()

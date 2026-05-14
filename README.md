@@ -93,6 +93,7 @@ BOT_ROLE=main
 CODEX_DISCORD_CONFIG=config/config.json
 DISCORD_GUILD_ID=123456789012345678
 LOG_LEVEL=INFO
+CODEX_DISCORD_DEVELOPER_INSTRUCTIONS_FILE=
 ```
 
 의미:
@@ -102,6 +103,7 @@ LOG_LEVEL=INFO
 - `BOT_ROLE`: `main`
 - `CODEX_DISCORD_CONFIG`: 설정 파일 경로. 기본값은 `config/config.json`
 - `DISCORD_GUILD_ID`: 지정하면 해당 guild에만 slash command를 빠르게 sync
+- `CODEX_DISCORD_DEVELOPER_INSTRUCTIONS_FILE`: 선택값. 지정하면 해당 파일 내용을 Codex app-server의 developer instructions로 전달
 
 ## config/config.json 설정
 

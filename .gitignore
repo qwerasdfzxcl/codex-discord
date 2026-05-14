@@ -1,6 +1,7 @@
 .codex
 .env
 .venv/
+AGENTS.md
 __pycache__/
 config/config.json
 .codex-discord-state/

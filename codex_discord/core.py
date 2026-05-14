@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ EMBED_COLOR_SUCCESS = 0x57F287
 EMBED_COLOR_WARNING = 0xFEE75C
 EMBED_COLOR_ERROR = 0xED4245
 NVM_NODE_BIN_PATH = Path.home() / ".nvm" / "versions" / "node" / "v22.22.2" / "bin"
+DEVELOPER_INSTRUCTIONS_FILE_ENV = "CODEX_DISCORD_DEVELOPER_INSTRUCTIONS_FILE"
 
 
 class ConfigError(Exception):
@@ -41,6 +43,30 @@ def build_codex_subprocess_env() -> dict[str, str]:
         current_path = env.get("PATH", "")
         env["PATH"] = f"{NVM_NODE_BIN_PATH}{os.pathsep}{current_path}" if current_path else str(NVM_NODE_BIN_PATH)
     return env
+
+
+def load_developer_instructions() -> str | None:
+    path_raw = os.getenv(DEVELOPER_INSTRUCTIONS_FILE_ENV, "").strip()
+    if not path_raw:
+        return None
+
+    path = Path(path_raw).expanduser()
+    if not path.is_file():
+        logging.warning("%s points to a missing file: %s", DEVELOPER_INSTRUCTIONS_FILE_ENV, path)
+        return None
+
+    try:
+        instructions = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        logging.exception("Failed to read developer instructions from %s", path)
+        return None
+    return instructions or None
+
+
+def hash_developer_instructions(instructions: str | None) -> str | None:
+    if not instructions:
+        return None
+    return hashlib.sha256(instructions.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -88,6 +114,7 @@ class ThreadSessionRecord:
     session_id: str
     workspace: Path
     updated_at: str
+    developer_instructions_hash: str | None = None
 
 
 @dataclass
@@ -467,16 +494,20 @@ class SessionStore:
             session_id = raw_record.get("session_id")
             workspace = raw_record.get("workspace")
             updated_at = raw_record.get("updated_at")
+            developer_instructions_hash = raw_record.get("developer_instructions_hash")
             if not isinstance(session_id, str) or not session_id:
                 continue
             if not isinstance(workspace, str) or not workspace:
                 continue
             if not isinstance(updated_at, str) or not updated_at:
                 updated_at = now_utc_iso()
+            if not isinstance(developer_instructions_hash, str):
+                developer_instructions_hash = None
             self._records[thread_id] = ThreadSessionRecord(
                 session_id=session_id,
                 workspace=Path(workspace),
                 updated_at=updated_at,
+                developer_instructions_hash=developer_instructions_hash,
             )
 
     def _save(self) -> None:
@@ -486,6 +517,7 @@ class SessionStore:
                     "session_id": record.session_id,
                     "workspace": str(record.workspace),
                     "updated_at": record.updated_at,
+                    "developer_instructions_hash": record.developer_instructions_hash,
                 }
                 for thread_id, record in self._records.items()
             }
@@ -496,11 +528,18 @@ class SessionStore:
     def get(self, thread_id: int) -> ThreadSessionRecord | None:
         return self._records.get(str(thread_id))
 
-    def set(self, thread_id: int, session_id: str, workspace: Path) -> None:
+    def set(
+        self,
+        thread_id: int,
+        session_id: str,
+        workspace: Path,
+        developer_instructions_hash: str | None = None,
+    ) -> None:
         self._records[str(thread_id)] = ThreadSessionRecord(
             session_id=session_id,
             workspace=workspace.resolve(),
             updated_at=now_utc_iso(),
+            developer_instructions_hash=developer_instructions_hash,
         )
         self._save()
 
